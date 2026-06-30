@@ -175,3 +175,4 @@ if __name__ == "__main__":
     print()
     custom_likelihood.plot_all(model_params, save_path=f"{outdir}/{args.bilby_label}_data_model_comparison.png")
     print(f"Data/model comparison plot saved to {outdir}/{args.bilby_label}_data_model_comparison.png")
+

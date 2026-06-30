@@ -113,7 +113,7 @@ class BaseModel(object):
     """Base class for all geometric models."""
 
     def __init__(self, params=None, model_list=['gauss'], dim=128, fov=225, 
-                 randomise_params=False, random_seed=None):
+                 randomise_params=False, random_seed=None, verbose=False):
         """Initializes the base model.
 
         Args:
@@ -124,6 +124,7 @@ class BaseModel(object):
             randomise_params (bool or list) : Whether to randomize parameters within their limits. 
                 If a list is provided, it should be the same length as model_list and specify whether to randomize each model's parameters.
             random_seed (int) : Random seed for reproducibility when randomizing parameters
+            verbose (bool) : Whether to print verbose output
         """
         if random_seed is not None:
             np.random.seed(random_seed)
@@ -134,6 +135,7 @@ class BaseModel(object):
         self.params = {}
         self.param_limits = {}
         self.param_fixed = {}
+        self.verbose = verbose
 
         if isinstance(randomise_params, bool):
             randomise_params = [randomise_params] * len(model_list)
@@ -161,12 +163,13 @@ class BaseModel(object):
         if params is not None:
             # check if all required params are there, more params can be provided
             if set(self.params) not in [set(params.keys()), set(params.keys()).intersection(set(self.params))]:
-                print("Provided parameters do not match required parameters for the model list.")
-                missing_params = set(self.params) - set(params.keys())
-                extra_params = set(params.keys()) - set(self.params)
-                print(f"Missing parameters: {missing_params}")
-                print(f"Extra parameters: {extra_params}")
-                print()
+                if self.verbose:
+                    print("Provided parameters do not match required parameters for the model list.")
+                    missing_params = set(self.params) - set(params.keys())
+                    extra_params = set(params.keys()) - set(self.params)
+                    print(f"Missing parameters: {missing_params}")
+                    print(f"Extra parameters: {extra_params}")
+                    print()
 
             else:
                 # set self.params equal to minimal set of provided params
@@ -179,7 +182,8 @@ class BaseModel(object):
         # if all models are the same model, we can apply some heuristics to center the model and fix the brightest component
         if len(set(model_list)) == 1 and len(model_list) > 1:
             self.center_and_fix_brightest(center=True, fix_brightest=True)
-            print("All models are the same, centering on brightest component and fixing its flux.")
+            if self.verbose:
+                print("All models are the same, centering on brightest component and fixing its flux.")
 
     def load_params_from_file(self, filepath):
         """Reads parameter properties from a json file and updates the model's parameters, limits, and fixed status.
@@ -189,15 +193,18 @@ class BaseModel(object):
         """
         with open(filepath, 'r') as f:
             data = json.load(f)
-            print(f"Loaded parameter properties from {filepath}.")
+            if self.verbose:
+                print(f"Loaded parameter properties from {filepath}.")
         for key in self.params.keys():
             if key in data:
                 self.params[key] = data[key]['value']
                 self.param_limits[key] = (data[key]['limit_low'], data[key]['limit_high'])
                 self.param_fixed[key] = data[key]['fixed']
-                print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
+                if self.verbose:
+                    print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
             else:
-                print(f"Parameter {key} not found in file, keeping existing value and limits.")
+                if self.verbose:
+                    print(f"Parameter {key} not found in file, keeping existing value and limits.")
 
         return
 
