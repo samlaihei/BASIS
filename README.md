@@ -7,7 +7,7 @@ It provides:
 - Geometric source models with analytic or direct visibility sampling.
 - Bilby-compatible likelihoods for visibility and closure-based data terms.
 - Utilities for image-domain ring diagnostics and morphology measurements.
-- Optional torch-backed computation for model evaluation.
+- Optional torch-backed computation.
 
 ## Core Components
 
@@ -24,7 +24,7 @@ Implemented model families include:
 - mring
 - pixelgrid
 
-Dynamic aliases are supported:
+Dynamic aliases are supported for mring and pixelgrid:
 
 - mringN for N Fourier-like ring coefficients, for example mring3.
 - pixelgridN for an N x N coarse grid, for example pixelgrid8.
@@ -69,7 +69,7 @@ Expected installation time: few minutes
 
 ## Quick Start
 
-### 1) Build and render a model image
+### 1) Build a model image
 
 ```python
 from BASIS.models.base import BaseModel
@@ -130,7 +130,7 @@ python runBilby.py \
   --data_weights="100"
 ```
 
-Outputs are written under examples/bilby_outdir/<label>/ including posterior files, corner plots, model image, and data-model comparison plots.
+Outputs are written under examples/bilby_outdir/ including posterior files, corner plot, model image, and data-model comparison plots.
 
 ## Examples
 
