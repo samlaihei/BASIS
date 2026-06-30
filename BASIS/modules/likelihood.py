@@ -1,4 +1,4 @@
-from GCFit.models import base
+from BASIS.models import base
 
 import bilby
 import numpy as np

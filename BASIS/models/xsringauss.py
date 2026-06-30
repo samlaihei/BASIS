@@ -4,9 +4,9 @@ from __future__ import print_function
 from builtins import object
 import numpy as np
 import torch
-import GCFit.modules.imutils as imutils
-import GCFit.modules.vis as vis
-import GCFit.modules.utils as utils
+import BASIS.modules.imutils as imutils
+import BASIS.modules.vis as vis
+import BASIS.modules.utils as utils
 
 MODEL_PARAMS = {
     "I0": {"value": 1, "limits": (0.05, 10), "fixed": False}, # Total flux density (Jy)

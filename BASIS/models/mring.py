@@ -4,10 +4,10 @@ from __future__ import print_function
 from builtins import object
 import numpy as np
 import torch
-import GCFit.modules.imutils as imutils
-import GCFit.modules.vis as vis
+import BASIS.modules.imutils as imutils
+import BASIS.modules.vis as vis
 import scipy.special as sp
-import GCFit.modules.utils as utils
+import BASIS.modules.utils as utils
 
 
 MODEL_PARAMS = {

@@ -6,9 +6,9 @@ import re
 import numpy as np
 import torch
 import torch.nn.functional as F
-import GCFit.modules.imutils as imutils
-import GCFit.modules.vis as vis
-import GCFit.modules.utils as utils
+import BASIS.modules.imutils as imutils
+import BASIS.modules.vis as vis
+import BASIS.modules.utils as utils
 
 DEFAULT_GRID_N = 6
 BASE_PIXEL_LIMS = (0, 10)

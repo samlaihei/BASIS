@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import json
 
-from GCFit.models import (
+from BASIS.models import (
     point,
     disk,
     gauss,
@@ -17,7 +17,7 @@ from GCFit.models import (
     mring,
     pixelgrid,
 )
-from GCFit.modules import vis
+from BASIS.modules import vis
 
 
 def _batch_image(image):

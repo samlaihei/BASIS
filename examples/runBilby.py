@@ -2,11 +2,11 @@ import numpy as np
 import ehtim as eh
 import bilby
 from bilby.core.utils import random
-import GCFit.modules.likelihood as likelihood
+import BASIS.modules.likelihood as likelihood
 import argparse
 
 import matplotlib.pyplot as plt
-from GCFit.models import base
+from BASIS.models import base
 
 try:
     import torch

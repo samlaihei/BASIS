@@ -4,7 +4,7 @@ import cv2
 from tqdm import tqdm
 from uncertainties import ufloat
 from scipy import integrate
-import GCFit.modules.imutils as imutils
+import BASIS.modules.imutils as imutils
 
 class RingFit():
     def __init__(self, imgarr, fov=225, interp_factor=2, blur_uas=0, total_flux=1):
