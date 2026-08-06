@@ -26,6 +26,8 @@ MODEL_PARAMS = {
     'mrcoeff5': {"value": 0.05, "limits": (0, 0.5), "fixed": False}, # m-ring coefficient 5 (0-0.5)
     'mrcoeff5_phase': {"value": 0.2, "limits": (-np.pi, np.pi), "fixed": False}, # phase of m-ring coefficient 5 (radians)
     # things get a little weird with more coefficients, so we cap off at 5 coeffs
+    "concGaussFlux": {"value": 0.6, "limits": (0, 0.99), "fixed": False}, # Fraction of flux in a central Gaussian (default is 0)
+    "concGaussSigma": {"value": 50, "limits": (1, 100), "fixed": False}, # Sigma of the central Gaussian (default is 1)
     'stretchx': {"value": 1, "limits": (0.5, 2), "fixed": True}, # Stretch term for the x-axis (default is 1)
     'stretchy': {"value": 1, "limits": (0.5, 2), "fixed": True} # Stretch term for the y-axis (default is 1)
 }
@@ -64,12 +66,13 @@ def _modified_bessel_in(n, x):
     return i_n
 
 
-class mring(object):
-    """Class for generating m-ring models."""
+class mgring(object):
+    """Class for generating mG-ring models."""
 
     def __init__(self, I0=1, Rp=40, phi=0,
                  dim=128, fov=225,
                  mrblur_sigma=5,
+                 concGaussFlux=0, concGaussSigma=50,
                  stretchx=1, stretchy=1,
                  **kwargs):
         """Creates an m-ring model.
@@ -108,8 +111,6 @@ class mring(object):
         self.coeff_magnitudes = [kwargs.get(f'mrcoeff{i+1}', 0) for i in range(n_coeffs)]
         self.coeff_phases = [kwargs.get(f'mrcoeff{i+1}_phase', 0) for i in range(n_coeffs)]
 
-        # Keep the Fourier coefficients in polar form at the parameter level,
-        # while using one complex vector in all model calculations.
         if utils._any_tensor([*self.coeff_magnitudes, *self.coeff_phases]):
             ref = next(value for value in [*self.coeff_magnitudes, *self.coeff_phases]
                        if torch.is_tensor(value))
@@ -123,15 +124,47 @@ class mring(object):
             ])
             self.coeffs = torch.polar(magnitudes, phases)
         else:
-            self.coeffs = np.array([m * np.exp(1j * p) for m, p in zip(self.coeff_magnitudes, self.coeff_phases)])
-        
+            self.coeffs = (np.asarray(self.coeff_magnitudes, dtype=float)
+                           * np.exp(1j * np.asarray(self.coeff_phases, dtype=float)))
+        self.concGaussFlux = concGaussFlux * self.I0
+        self.concGaussSigma = concGaussSigma
+        self.I0 = self.I0 * (1 - concGaussFlux)
 
         self.X = np.linspace(-self.fov/2, self.fov/2,self.dim)
         self.Y = np.linspace(-self.fov/2, self.fov/2,self.dim)
         self.psize = (self.X[1]-self.X[0])
         
 
-    
+    def concGauss_component(self):
+        """Generates the central Gaussian component of the model.
+
+        Returns:
+            Central Gaussian component of the model
+        """
+        if utils._any_tensor([self.concGaussFlux, self.concGaussSigma, self.phi]):
+            ref = next(v for v in [self.concGaussFlux, self.concGaussSigma, self.phi] if torch.is_tensor(v))
+            X = torch.linspace(-self.fov/2, self.fov/2, self.dim, dtype=ref.dtype, device=ref.device)
+            Y = torch.linspace(-self.fov/2, self.fov/2, self.dim, dtype=ref.dtype, device=ref.device)
+            xx, yy = torch.meshgrid(X, Y, indexing='xy')
+            bg_gauss_flux, bg_gauss_sigma = utils._as_tensors(self.concGaussFlux, self.concGaussSigma, dtype=ref.dtype, device=ref.device)
+            cos_phi = torch.cos(self.phi+torch.pi/2)
+            sin_phi = torch.sin(self.phi+torch.pi/2)
+            stretchx, stretchy = utils._as_tensors(self.stretchx, self.stretchy, dtype=ref.dtype, device=ref.device)
+            x0 = xx * cos_phi / stretchx + yy * sin_phi / stretchy
+            y0 = -yy * cos_phi / stretchy + xx * sin_phi / stretchx
+            bg_gauss_arr = torch.exp(-(x0**2 + y0**2)/(2.*bg_gauss_sigma**2))
+            bg_gauss_arr = bg_gauss_arr / bg_gauss_arr.sum() * bg_gauss_flux
+            return bg_gauss_arr
+        cos_phi = np.cos(self.phi+np.pi/2)
+        sin_phi = np.sin(self.phi+np.pi/2)
+        xx, yy = np.meshgrid(self.X, self.Y, indexing='xy')
+        x0 = xx * cos_phi / self.stretchx + yy * sin_phi / self.stretchy
+        y0 = -yy * cos_phi / self.stretchy + xx * sin_phi / self.stretchx
+        bg_gauss_arr = np.exp(-(x0**2 + y0**2)/(2.*self.concGaussSigma**2))
+        bg_gauss_arr = bg_gauss_arr/np.sum(bg_gauss_arr)*self.concGaussFlux
+        return bg_gauss_arr
+        
+
     def sky_map(self):
         """Generates the intensity map of the model
          
@@ -139,14 +172,14 @@ class mring(object):
             Intensity map of the model
         """ 
         tensor_params = [self.I0, self.Rp, self.phi, self.mrblur_sigma,
-                         self.stretchx, self.stretchy, *self.coeff_magnitudes,
-                         *self.coeff_phases]
+                         self.concGaussFlux, self.concGaussSigma, self.stretchx,
+                         self.stretchy, *self.coeff_magnitudes, *self.coeff_phases]
         if utils._any_tensor(tensor_params):
             ref = next(value for value in tensor_params if torch.is_tensor(value))
             X = torch.linspace(-self.fov/2, self.fov/2, self.dim, dtype=ref.dtype, device=ref.device)
             Y = torch.linspace(-self.fov/2, self.fov/2, self.dim, dtype=ref.dtype, device=ref.device)
             xx, yy = torch.meshgrid(X, Y, indexing='xy')
-            I0, Rp, phi, mrblur_fwhm, stretchx, stretchy = utils._as_tensors(self.I0, self.Rp, self.phi, self.mrblur_fwhm, self.stretchx, self.stretchy, dtype=ref.dtype, device=ref.device)
+            I0, Rp, phi, mrblur_fwhm, concGaussFlux, concGaussSigma, stretchx, stretchy = utils._as_tensors(self.I0, self.Rp, self.phi, self.mrblur_fwhm, self.concGaussFlux, self.concGaussSigma, self.stretchx, self.stretchy, dtype=ref.dtype, device=ref.device)
             cos_phi = torch.cos(phi)
             sin_phi = torch.sin(phi)
             x0 = xx * cos_phi / stretchx + yy * sin_phi / stretchy
@@ -164,6 +197,8 @@ class mring(object):
                 mring = mring + coeff_t * ik * torch.polar(torch.ones_like(phi0), k * phi0) + torch.conj(coeff_t) * ik * torch.polar(torch.ones_like(phi0), -k * phi0)
             mring_arr = gauss_blur * torch.real(mring)
             mring_arr = torch.real(mring_arr) / mring_arr.sum() * I0
+            concGaussArr = self.concGauss_component()
+            mring_arr = mring_arr + concGaussArr
             return mring_arr
 
         A = 4 * np.log(2) * self.I0 / (self.mrblur_fwhm**2)
@@ -187,6 +222,8 @@ class mring(object):
         mring_arr = gauss_blur * np.real(mring)
 
         mring_arr = np.real(mring_arr)/np.sum(mring_arr)*self.I0
+        concGaussArr = self.concGauss_component()
+        mring_arr = mring_arr + concGaussArr
 
         return mring_arr
 
@@ -222,10 +259,11 @@ class mring(object):
             stretchy = torch.as_tensor(self.stretchy, dtype=uv.dtype, device=uv.device)
             u_rot = stretchx * uv[0] * torch.cos(phi) + stretchy * uv[1] * torch.sin(phi)
             v_rot = stretchx * uv[0] * torch.sin(phi) - stretchy * uv[1] * torch.cos(phi)
+            uv_rot = torch.stack([u_rot, v_rot], dim=0)
+            stretch = torch.tensor([self.stretchx, self.stretchy], dtype=uv.dtype, device=uv.device)
             rho_uv = torch.sqrt(u_rot**2 + v_rot**2)
             phi_uv = torch.atan2(v_rot, u_rot)
             x = torch.pi * self.d * 1e-6 / 206265 * rho_uv
-
             anaVis = _bessel_jn(0, x).to(torch.complex64)
             for m, coeff in enumerate(self.coeffs):
                 k = m + 1
@@ -237,8 +275,12 @@ class mring(object):
                     torch.ones_like(phi_uv),
                     torch.full_like(phi_uv, -k * torch.pi / 2),
                 )
-                anaVis = anaVis + fourier_phase * j_pos * (coeff_t * e_pos + torch.conj(coeff_t) * e_neg)
+                anaVis = anaVis + fourier_phase * j_pos * (
+                    coeff_t * e_pos + torch.conj(coeff_t) * e_neg
+                )
 
             blur = torch.exp(- (torch.pi * self.mrblur_fwhm * 1e-6 / 206265 * rho_uv) ** 2 / (4 * torch.log(torch.tensor(2.0, dtype=uv.dtype, device=uv.device))))
             anaVis = anaVis * self.I0 * blur
+            if self.concGaussFlux > 0:
+                anaVis += vis.stretch_vis(uv, lambda uv: vis.circ_gauss(uv, self.concGaussFlux, self.concGaussSigma*1e-6/206265, offset=(0,0)), stretch=stretch)
             return anaVis

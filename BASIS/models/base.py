@@ -15,6 +15,7 @@ from BASIS.models import (
     xsringauss,
     sdisk,
     mring,
+    mgring,
     pixelgrid,
 )
 from BASIS.modules import vis
@@ -27,10 +28,10 @@ def _batch_image(image):
 
 MODEL_LIST = {'point': point.point, 'disk':disk.disk, 'gauss':gauss.gauss, 'sdisk':sdisk.sdisk,
               'xsring':xsring.xsring, 'xsringauss':xsringauss.xsringauss,
-            'mring': mring.mring, 'pixelgrid': pixelgrid.pixelgrid}
+            'mring': mring.mring, 'mgring': mgring.mgring, 'pixelgrid': pixelgrid.pixelgrid}
 MODEL_PARAMS = {'point': point.MODEL_PARAMS, 'disk': disk.MODEL_PARAMS, 'gauss': gauss.MODEL_PARAMS, 'sdisk': sdisk.MODEL_PARAMS,
                    'xsring': xsring.MODEL_PARAMS, 'xsringauss': xsringauss.MODEL_PARAMS, 
-                'mring': mring.MODEL_PARAMS, 'pixelgrid': pixelgrid.MODEL_PARAMS}
+                'mring': mring.MODEL_PARAMS, 'mgring': mgring.MODEL_PARAMS, 'pixelgrid': pixelgrid.MODEL_PARAMS}
 
 
 def _resolve_model_name(model_name):
@@ -38,12 +39,12 @@ def _resolve_model_name(model_name):
     if model_name in MODEL_LIST:
         return model_name
 
-    match = re.fullmatch(r"mring(\d+)", model_name)
+    match = re.fullmatch(r"(mring|mgring)(\d+)", model_name)
     if match:
-        ncoeff = int(match.group(1))
+        ncoeff = int(match.group(2))
         if ncoeff < 1:
             raise ValueError("mring coefficient count must be >= 1.")
-        return 'mring'
+        return match.group(1)
 
     match = re.fullmatch(r"pixelgrid(\d+)", model_name)
     if match:
@@ -59,21 +60,25 @@ def _params_for_model(model_name):
     """Return required parameters for a model, including dynamic mringN coefficients."""
     resolved = _resolve_model_name(model_name)
 
-    if resolved not in ['mring', 'pixelgrid']:
+    if resolved not in ['mring', 'mgring', 'pixelgrid']:
         return MODEL_PARAMS[resolved].keys()
 
-    if resolved == 'mring':
-        match = re.fullmatch(r"mring(\d+)", model_name)
+    if resolved == 'mring' or resolved == 'mgring':
+        match = re.fullmatch(r"(mring|mgring)(\d+)", model_name)
         if match:
-            ncoeff = int(match.group(1))
+            ncoeff = int(match.group(2))
         else:
-            # Keep legacy behaviour for plain "mring".
-            ncoeff = len([p for p in MODEL_PARAMS['mring'].keys() if p.startswith('mrcoeff')])
+            # Keep legacy behaviour for plain "mring" or "mgring".
+            ncoeff = len([p for p in MODEL_PARAMS[resolved].keys()
+                          if re.fullmatch(r"mrcoeff\d+", p)])
             if ncoeff < 1:
                 ncoeff = 1
 
-        base_params = [p for p in MODEL_PARAMS['mring'].keys() if not p.startswith('mrcoeff')]
+        base_params = [p for p in MODEL_PARAMS[resolved].keys() if not p.startswith('mrcoeff')]
         coeff_params = [f"mrcoeff{i+1}" for i in range(ncoeff)]
+        if resolved in ['mring', 'mgring']:
+            coeff_params = [param for i in range(ncoeff)
+                            for param in (f"mrcoeff{i+1}", f"mrcoeff{i+1}_phase")]
         return base_params + coeff_params
 
     match = re.fullmatch(r"pixelgrid(\d+)", model_name)
@@ -95,11 +100,26 @@ def _defaults_for_param(model_name, param):
     """Return defaults entry, using shared defaults for dynamic mrcoeffN parameters."""
     resolved = _resolve_model_name(model_name)
     
-    if resolved not in ['mring', 'pixelgrid']:
+    if resolved not in ['mring', 'mgring', 'pixelgrid']:
         return MODEL_PARAMS[resolved][param]
 
     if resolved == 'mring':
-        return MODEL_PARAMS['mring'][param]
+        if param in MODEL_PARAMS['mring']:
+            return MODEL_PARAMS['mring'][param]
+        if re.fullmatch(r"mrcoeff\d+", param):
+            return MODEL_PARAMS['mring']['mrcoeff1']
+        if re.fullmatch(r"mrcoeff\d+_phase", param):
+            return MODEL_PARAMS['mring']['mrcoeff1_phase']
+        raise KeyError(f"No defaults configured for parameter {param}.")
+
+    if resolved == 'mgring':
+        if param in MODEL_PARAMS['mgring']:
+            return MODEL_PARAMS['mgring'][param]
+        if re.fullmatch(r"mrcoeff\d+", param):
+            return MODEL_PARAMS['mgring']['mrcoeff1']
+        if re.fullmatch(r"mrcoeff\d+_phase", param):
+            return MODEL_PARAMS['mgring']['mrcoeff1_phase']
+        raise KeyError(f"No defaults configured for parameter {param}.")
 
     if param in MODEL_PARAMS['pixelgrid']:
         return MODEL_PARAMS['pixelgrid'][param]
@@ -113,7 +133,7 @@ class BaseModel(object):
     """Base class for all geometric models."""
 
     def __init__(self, params=None, model_list=['gauss'], dim=128, fov=225, 
-                 randomise_params=False, random_seed=None, verbose=False):
+                 randomise_params=False, random_seed=None):
         """Initializes the base model.
 
         Args:
@@ -124,7 +144,6 @@ class BaseModel(object):
             randomise_params (bool or list) : Whether to randomize parameters within their limits. 
                 If a list is provided, it should be the same length as model_list and specify whether to randomize each model's parameters.
             random_seed (int) : Random seed for reproducibility when randomizing parameters
-            verbose (bool) : Whether to print verbose output
         """
         if random_seed is not None:
             np.random.seed(random_seed)
@@ -135,7 +154,6 @@ class BaseModel(object):
         self.params = {}
         self.param_limits = {}
         self.param_fixed = {}
-        self.verbose = verbose
 
         if isinstance(randomise_params, bool):
             randomise_params = [randomise_params] * len(model_list)
@@ -163,13 +181,12 @@ class BaseModel(object):
         if params is not None:
             # check if all required params are there, more params can be provided
             if set(self.params) not in [set(params.keys()), set(params.keys()).intersection(set(self.params))]:
-                if self.verbose:
-                    print("Provided parameters do not match required parameters for the model list.")
-                    missing_params = set(self.params) - set(params.keys())
-                    extra_params = set(params.keys()) - set(self.params)
-                    print(f"Missing parameters: {missing_params}")
-                    print(f"Extra parameters: {extra_params}")
-                    print()
+                print("Provided parameters do not match required parameters for the model list.")
+                missing_params = set(self.params) - set(params.keys())
+                extra_params = set(params.keys()) - set(self.params)
+                print(f"Missing parameters: {missing_params}")
+                print(f"Extra parameters: {extra_params}")
+                print()
 
             else:
                 # set self.params equal to minimal set of provided params
@@ -182,8 +199,7 @@ class BaseModel(object):
         # if all models are the same model, we can apply some heuristics to center the model and fix the brightest component
         if len(set(model_list)) == 1 and len(model_list) > 1:
             self.center_and_fix_brightest(center=True, fix_brightest=True)
-            if self.verbose:
-                print("All models are the same, centering on brightest component and fixing its flux.")
+            print("All models are the same, centering on brightest component and fixing its flux.")
 
     def load_params_from_file(self, filepath):
         """Reads parameter properties from a json file and updates the model's parameters, limits, and fixed status.
@@ -193,18 +209,15 @@ class BaseModel(object):
         """
         with open(filepath, 'r') as f:
             data = json.load(f)
-            if self.verbose:
-                print(f"Loaded parameter properties from {filepath}.")
+            print(f"Loaded parameter properties from {filepath}.")
         for key in self.params.keys():
             if key in data:
                 self.params[key] = data[key]['value']
                 self.param_limits[key] = (data[key]['limit_low'], data[key]['limit_high'])
                 self.param_fixed[key] = data[key]['fixed']
-                if self.verbose:
-                    print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
+                print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
             else:
-                if self.verbose:
-                    print(f"Parameter {key} not found in file, keeping existing value and limits.")
+                print(f"Parameter {key} not found in file, keeping existing value and limits.")
 
         return
 

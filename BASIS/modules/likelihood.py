@@ -286,7 +286,7 @@ class ModelLikelihood(bilby.Likelihood):
             if dtype not in self.cached_data:
                 adv, adv_noise = self.calc_advariants(count=self.count)
                 self.cached_data[dtype], self.cached_noise['sigma'+dtype] = self.advariants_to_ci(adv, self.obs.bispec['time'], adv_noise)
-                self.cached_noise['sigma'+dtype] = self.estimate_noise_ci() # MC-style estimation of CI noise, assuming independent Gaussian noise on visibilities
+                # self.cached_noise['sigma'+dtype] = self.estimate_noise_ci()  # Analytic by default; MC available via method='mc'
                 self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
                 self.uv[dtype] = np.array([[self.obs.bispec['u1'], self.obs.bispec['v1']],
                                 [self.obs.bispec['u2'], self.obs.bispec['v2']],
@@ -622,8 +622,18 @@ class ModelLikelihood(bilby.Likelihood):
         return real_valued_advariants, None
     
     
-    def estimate_noise_ci(self, N=1000): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
+    def estimate_noise_ci(self, N=1000, method='analytic'):
         """Estimate the noise for closure invariant data.
+
+        Parameters
+        ----------
+        N : int, optional
+            Number of Monte Carlo samples when ``method='mc'`` (default is 1000).
+        method : str, optional
+            Noise estimation strategy:
+            - ``'analytic'``: propagate visibility noise to advariants and then to CI.
+            - ``'mc'``: Monte Carlo sampling with Gaussian visibility noise.
+            Default is ``'analytic'``.
 
         Returns
         -------
@@ -631,16 +641,25 @@ class ModelLikelihood(bilby.Likelihood):
             The estimated noise for closure invariant data.
         """
 
-        advariants_noisy = self.calc_advariants(N=N, add_noise=True, count=self.count)[0]
+        method_l = method.lower()
+        if method_l == 'analytic':
+            advariants, advariants_noise = self.calc_advariants(count=self.count)
+            _, sigma_ci = self.advariants_to_ci(advariants, self.obs.bispec['time'], advariants_noise)
+            return sigma_ci
 
-        ci_noisy_samples = []
-        for i in range(N):
-            ci_noisy = self.advariants_to_ci(advariants_noisy[i], self.obs.bispec['time'])[0]
-            ci_noisy_samples.append(ci_noisy)
-        ci_noisy_samples = np.array(ci_noisy_samples)
+        if method_l == 'mc':
+            advariants_noisy = self.calc_advariants(N=N, add_noise=True, count=self.count)[0]
 
-        sigma_ci = np.std(ci_noisy_samples, axis=0)
-        return sigma_ci
+            ci_noisy_samples = []
+            for i in range(N):
+                ci_noisy = self.advariants_to_ci(advariants_noisy[i], self.obs.bispec['time'])[0]
+                ci_noisy_samples.append(ci_noisy)
+            ci_noisy_samples = np.array(ci_noisy_samples)
+
+            sigma_ci = np.std(ci_noisy_samples, axis=0)
+            return sigma_ci
+
+        raise ValueError(f"Unknown CI noise estimation method '{method}'. Use 'analytic' or 'mc'.")
 
     def plot_all(self, parameters, save_path=None):
         """Plot the data and model for all data types.
