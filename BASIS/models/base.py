@@ -55,7 +55,6 @@ def _resolve_model_name(model_name):
 
     raise ValueError(f"Model {model_name} is not recognized.")
 
-
 def _params_for_model(model_name):
     """Return required parameters for a model, including dynamic mringN coefficients."""
     resolved = _resolve_model_name(model_name)
@@ -215,9 +214,10 @@ class BaseModel(object):
                 self.params[key] = data[key]['value']
                 self.param_limits[key] = (data[key]['limit_low'], data[key]['limit_high'])
                 self.param_fixed[key] = data[key]['fixed']
-                print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
+                # print(f"Updated parameter {key}: value={self.params[key]}, limits={self.param_limits[key]}, fixed={self.param_fixed[key]}")
             else:
-                print(f"Parameter {key} not found in file, keeping existing value and limits.")
+                # print(f"Parameter {key} not found in file, keeping existing value and limits.")
+                pass
 
         return
 

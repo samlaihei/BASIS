@@ -14,7 +14,8 @@ setup(
         'tqdm',
         'uncertainties',
         'opencv-python',
-        'torch'
+        'torch',
+        'nevergrad'
     ],
     author='Samuel Lai',
 )

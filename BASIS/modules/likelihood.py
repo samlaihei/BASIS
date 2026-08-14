@@ -95,6 +95,17 @@ class ModelLikelihood(bilby.Likelihood):
         residual = data - model_data
         return -0.5 * np.sum(np.abs((residual / sigma) ** 2) + np.log(2 * np.pi * sigma ** 2))
 
+    def _gaussian_redchi2(self, data, model_data, sigma):
+        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
+            like = model_data if self._is_torch(model_data) else data
+            data_t = self._to_torch(data, like=like, complex_ok=True)
+            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+            residual_t = data_t - model_t
+            sigma_t = self._to_torch(sigma, like=residual_t, complex_ok=False)
+            return torch.sum(torch.abs(residual_t / sigma_t) ** 2)/len(data_t)
+        residual = data - model_data
+        return np.sum(np.abs(residual / sigma) ** 2)/len(data)
+
     def advariants_to_ci_torch(self, advariants, times):
         """Normalise advariants to closure invariants with torch operations."""
         advariants_t = self._to_torch(advariants, complex_ok=True)
@@ -128,6 +139,24 @@ class ModelLikelihood(bilby.Likelihood):
         """
         self.model.params = parameters
         return self.model
+
+    def reduced_chi2(self, parameters, dtype='vis'):
+        """Calculate the reduced chi-squared for the given parameters.
+        
+        Parameters
+        ----------
+        parameters : dict
+            The model parameters.
+        dtype : str, optional
+            The data type to use for the reduced chi-squared calculation ('image', 'vis', 'visamp', 'bispec', 'cphase', 'camp', 'logcamp', 'ci'). Default is 'vis'.
+
+        Returns
+        -------
+        redchi2 : float
+            The reduced chi-squared.
+        """
+        data, sigma, model_data = self.sample_data(parameters, dtype=dtype)
+        return self._gaussian_redchi2(data, model_data, sigma)
 
     def log_likelihood(self, parameters):
         """Calculate the total log-likelihood for the given parameters.
@@ -286,7 +315,7 @@ class ModelLikelihood(bilby.Likelihood):
             if dtype not in self.cached_data:
                 adv, adv_noise = self.calc_advariants(count=self.count)
                 self.cached_data[dtype], self.cached_noise['sigma'+dtype] = self.advariants_to_ci(adv, self.obs.bispec['time'], adv_noise)
-                # self.cached_noise['sigma'+dtype] = self.estimate_noise_ci()  # Analytic by default; MC available via method='mc'
+                # self.cached_noise['sigma'+dtype] = self.estimate_noise_ci() # MC-style estimation of CI noise, assuming independent Gaussian noise on visibilities
                 self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
                 self.uv[dtype] = np.array([[self.obs.bispec['u1'], self.obs.bispec['v1']],
                                 [self.obs.bispec['u2'], self.obs.bispec['v2']],
@@ -519,6 +548,7 @@ class ModelLikelihood(bilby.Likelihood):
         advariants = [[] for i in range(N)]
         advariants_noise = [[] for i in range(N)]
         for tdata in tlist:
+            tdata = tdata.astype(self.obs.data.dtype)
             sites = list(set(np.hstack((tdata['t1'], tdata['t2']))))
 
             # Create a dictionary of baselines at the current time incl. conjugates;
@@ -622,18 +652,8 @@ class ModelLikelihood(bilby.Likelihood):
         return real_valued_advariants, None
     
     
-    def estimate_noise_ci(self, N=1000, method='analytic'):
+    def estimate_noise_ci(self, N=1000): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
         """Estimate the noise for closure invariant data.
-
-        Parameters
-        ----------
-        N : int, optional
-            Number of Monte Carlo samples when ``method='mc'`` (default is 1000).
-        method : str, optional
-            Noise estimation strategy:
-            - ``'analytic'``: propagate visibility noise to advariants and then to CI.
-            - ``'mc'``: Monte Carlo sampling with Gaussian visibility noise.
-            Default is ``'analytic'``.
 
         Returns
         -------
@@ -641,25 +661,16 @@ class ModelLikelihood(bilby.Likelihood):
             The estimated noise for closure invariant data.
         """
 
-        method_l = method.lower()
-        if method_l == 'analytic':
-            advariants, advariants_noise = self.calc_advariants(count=self.count)
-            _, sigma_ci = self.advariants_to_ci(advariants, self.obs.bispec['time'], advariants_noise)
-            return sigma_ci
+        advariants_noisy = self.calc_advariants(N=N, add_noise=True, count=self.count)[0]
 
-        if method_l == 'mc':
-            advariants_noisy = self.calc_advariants(N=N, add_noise=True, count=self.count)[0]
+        ci_noisy_samples = []
+        for i in range(N):
+            ci_noisy = self.advariants_to_ci(advariants_noisy[i], self.obs.bispec['time'])[0]
+            ci_noisy_samples.append(ci_noisy)
+        ci_noisy_samples = np.array(ci_noisy_samples)
 
-            ci_noisy_samples = []
-            for i in range(N):
-                ci_noisy = self.advariants_to_ci(advariants_noisy[i], self.obs.bispec['time'])[0]
-                ci_noisy_samples.append(ci_noisy)
-            ci_noisy_samples = np.array(ci_noisy_samples)
-
-            sigma_ci = np.std(ci_noisy_samples, axis=0)
-            return sigma_ci
-
-        raise ValueError(f"Unknown CI noise estimation method '{method}'. Use 'analytic' or 'mc'.")
+        sigma_ci = np.std(ci_noisy_samples, axis=0)
+        return sigma_ci
 
     def plot_all(self, parameters, save_path=None):
         """Plot the data and model for all data types.
@@ -675,9 +686,13 @@ class ModelLikelihood(bilby.Likelihood):
         errorbar_alpha = 0.4
 
         dterms = {'Visibility Amplitude': 'visamp', 'Visibility Phase': 'vis', 'Bispectrum Amplitude': 'bispec',
-                'Closure Phase': 'cphase', 'Closure Amplitude': 'camp', 'Log Closure Amplitude': 'logcamp', 'Closure Invariants Amplitude': 'ci', 'Closure Invariants Phase': 'ci'}
+                'Closure Phase': 'cphase', 'Closure Amplitude': 'camp', 'Log Closure Amplitude': 'logcamp', 'Closure Invariants Amplitude': 'ci', 'Closure Invariants Phase': 'ci',}
+                # 'Closure Invariants Real': 'ci', 'Closure Invariants Imag': 'ci', 
+                # 'log Closure Invariants Real': 'ci', 'log Closure Invariants Imag': 'ci'}
         ops = {'Visibility Amplitude': np.abs, 'Visibility Phase': np.angle, 'Bispectrum Amplitude': np.abs, 
-            'Closure Phase': lambda x: x, 'Closure Amplitude': np.abs, 'Log Closure Amplitude': lambda x: x, 'Closure Invariants Amplitude': np.abs, 'Closure Invariants Phase': np.angle}
+            'Closure Phase': lambda x: x, 'Closure Amplitude': np.abs, 'Log Closure Amplitude': lambda x: x, 'Closure Invariants Amplitude': np.abs, 'Closure Invariants Phase': np.angle,}
+            # 'Closure Invariants Real': np.real, 'Closure Invariants Imag': np.imag,
+            # 'log Closure Invariants Real': lambda x: np.log(np.real(x)), 'log Closure Invariants Imag': lambda x: np.log(np.imag(x))}
 
         for i, (title, dtype) in enumerate(dterms.items()):
             data, sigma, model_data = self.sample_data(parameters, dtype=dtype, ttype='analytical')
@@ -702,6 +717,8 @@ class ModelLikelihood(bilby.Likelihood):
             if parameters is not None:
                 axs[i%2, i//2].scatter(uvdist, ops[title](model_data), color='red', s=5, label='Model')
             axs[i%2, i//2].set_title(title)
+            if 'Phase' in title:
+                axs[i%2, i//2].set_ylim(-np.pi*1.1, np.pi*1.1)
             if i == 0:
                 axs[i%2, i//2].legend()
 

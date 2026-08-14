@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import BASIS.modules.imutils as imutils
 import BASIS.modules.vis as vis
-import scipy.special as sp
 import BASIS.modules.utils as utils
+import scipy.special as sp
 
 
 MODEL_PARAMS = {
@@ -27,7 +27,7 @@ MODEL_PARAMS = {
     'mrcoeff5_phase': {"value": 0.2, "limits": (-np.pi, np.pi), "fixed": False}, # phase of m-ring coefficient 5 (radians)
     # things get a little weird with more coefficients, so we cap off at 5 coeffs
     "concGaussFlux": {"value": 0.6, "limits": (0, 0.99), "fixed": False}, # Fraction of flux in a central Gaussian (default is 0)
-    "concGaussSigma": {"value": 50, "limits": (1, 100), "fixed": False}, # Sigma of the central Gaussian (default is 1)
+    "concGaussSigma": {"value": 50, "limits": (5, 100), "fixed": False}, # Sigma of the central Gaussian (default is 1)
     'stretchx': {"value": 1, "limits": (0.5, 2), "fixed": True}, # Stretch term for the x-axis (default is 1)
     'stretchy': {"value": 1, "limits": (0.5, 2), "fixed": True} # Stretch term for the y-axis (default is 1)
 }

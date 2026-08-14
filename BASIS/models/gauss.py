@@ -15,7 +15,7 @@ MODEL_PARAMS = {
     "pa": {"value":20*np.pi/180, "limits": (0, np.pi), "fixed": False}, # Position angle (0-pi radians)
     'xoff': {"value": 15, "limits": (-80, 80), "fixed": False}, # x offset (in uas)
     'yoff': {"value": -30, "limits": (-80, 80), "fixed": False}, # y offset (in uas)
-    'gauss_blur_sigma': {"value": 4, "limits": (0, 10), "fixed": False}, # Gaussian blur sigma (in uas)
+    'gauss_blur_sigma': {"value": 0, "limits": (0, 10), "fixed": True}, # Gaussian blur sigma (in uas)
     'stretchx': {"value": 1., "limits": (0.5, 2), "fixed": True}, # Stretch term for the x-axis (default is 1)
     'stretchy': {"value": 1., "limits": (0.5, 2), "fixed": True}, # Stretch term for the y-axis (default is 1)
 }

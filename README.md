@@ -22,11 +22,12 @@ Implemented model families include:
 - xsring
 - xsringauss
 - mring
+- mgring
 - pixelgrid
 
-Dynamic aliases are supported for mring and pixelgrid:
+Dynamic aliases are supported for mring, mgring, and pixelgrid:
 
-- mringN for N Fourier-like ring coefficients, for example mring3.
+- mringN or mgringN for N Fourier-like ring coefficients, for example mring3.
 - pixelgridN for an N x N coarse grid, for example pixelgrid8.
 
 ### Likelihoods
@@ -57,6 +58,7 @@ ModelLikelihood integrates with bilby and supports weighted combinations of:
 - uncertainties
 - opencv-python
 - torch
+- nevergrad
 
 ### Install from source
 
@@ -138,6 +140,7 @@ Notebook and script examples are available in examples/:
 
 - Example_BASIS.ipynb
 - Example_bilby.ipynb
+- Example_opt.ipynb
 - Example_ringFitting.ipynb
 - runBilby.py
 - runBilby.sh
