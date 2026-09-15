@@ -11,6 +11,7 @@ from BASIS.models import (
     point,
     disk,
     gauss,
+    ring,
     xsring,
     xsringauss,
     sdisk,
@@ -27,10 +28,10 @@ def _batch_image(image):
     return np.expand_dims(image, 0)
 
 MODEL_LIST = {'point': point.point, 'disk':disk.disk, 'gauss':gauss.gauss, 'sdisk':sdisk.sdisk,
-              'xsring':xsring.xsring, 'xsringauss':xsringauss.xsringauss,
+              'ring': ring.ring, 'xsring':xsring.xsring, 'xsringauss':xsringauss.xsringauss,
             'mring': mring.mring, 'mgring': mgring.mgring, 'pixelgrid': pixelgrid.pixelgrid}
 MODEL_PARAMS = {'point': point.MODEL_PARAMS, 'disk': disk.MODEL_PARAMS, 'gauss': gauss.MODEL_PARAMS, 'sdisk': sdisk.MODEL_PARAMS,
-                   'xsring': xsring.MODEL_PARAMS, 'xsringauss': xsringauss.MODEL_PARAMS, 
+                   'ring': ring.MODEL_PARAMS, 'xsring': xsring.MODEL_PARAMS, 'xsringauss': xsringauss.MODEL_PARAMS, 
                 'mring': mring.MODEL_PARAMS, 'mgring': mgring.MODEL_PARAMS, 'pixelgrid': pixelgrid.MODEL_PARAMS}
 
 
@@ -294,6 +295,8 @@ class BaseModel(object):
         """
         if len(new_params) != len(self.params):
             raise ValueError(f"Expected {len(self.params)} parameters, got {len(new_params)}.")
+        if isinstance(new_params, dict):
+            new_params = [new_params[key] for key in self.params.keys()]
         for i, key in enumerate(self.params.keys()):
             low, high = self.param_limits[key]
             value = new_params[i]

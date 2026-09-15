@@ -6,15 +6,15 @@ import numpy as np
 import torch
 import BASIS.modules.imutils as imutils
 import BASIS.modules.vis as vis
-import BASIS.modules.utils as utils
 import scipy.special as sp
+import BASIS.modules.utils as utils
 
 
 MODEL_PARAMS = {
     'I0': {"value": 1, "limits": (0.05, 10), "fixed": False}, # Total flux density (Jy)
     "Rp": {"value": 24, "limits": (10, 40), "fixed": False}, # Outer radius (uas)
     "phi": {"value": 180*np.pi/180, "limits": (0, 2*np.pi), "fixed": False}, # Orientation angle (0-2pi radians)
-    'mrblur_sigma': {"value": 6, "limits": (5, 15), "fixed": False}, # m-ring Gaussian blur sigma (uas)
+    'mrblur_sigma': {"value": 6, "limits": (2, 15), "fixed": False}, # m-ring Gaussian blur sigma (uas)
     'mrcoeff1': {"value": 0.5, "limits": (0, 0.5), "fixed": False}, # m-ring coefficient 1 (0-0.5)
     'mrcoeff1_phase': {"value": 0, "limits": (-np.pi, np.pi), "fixed": True}, # phase of m-ring coefficient 1 (radians)
     'mrcoeff2': {"value": 0.25, "limits": (0, 0.5), "fixed": False}, # m-ring coefficient 2 (0-0.5)
@@ -257,29 +257,42 @@ class mgring(object):
             phi = torch.as_tensor(self.phi, dtype=uv.dtype, device=uv.device)
             stretchx = torch.as_tensor(self.stretchx, dtype=uv.dtype, device=uv.device)
             stretchy = torch.as_tensor(self.stretchy, dtype=uv.dtype, device=uv.device)
-            u_rot = stretchx * uv[0] * torch.cos(phi) + stretchy * uv[1] * torch.sin(phi)
-            v_rot = stretchx * uv[0] * torch.sin(phi) - stretchy * uv[1] * torch.cos(phi)
-            uv_rot = torch.stack([u_rot, v_rot], dim=0)
+            cos_phi = torch.cos(phi)
+            sin_phi = torch.sin(phi)
+            u_rot = stretchx * uv[0] * cos_phi + stretchy * uv[1] * sin_phi
+            v_rot = stretchx * uv[0] * sin_phi - stretchy * uv[1] * cos_phi
             stretch = torch.tensor([self.stretchx, self.stretchy], dtype=uv.dtype, device=uv.device)
             rho_uv = torch.sqrt(u_rot**2 + v_rot**2)
             phi_uv = torch.atan2(v_rot, u_rot)
-            x = torch.pi * self.d * 1e-6 / 206265 * rho_uv
-            anaVis = _bessel_jn(0, x).to(torch.complex64)
-            for m, coeff in enumerate(self.coeffs):
-                k = m + 1
-                coeff_t = torch.as_tensor(coeff, dtype=anaVis.dtype, device=uv.device)
-                j_pos = _bessel_jn(k, x)
-                e_pos = torch.polar(torch.ones_like(phi_uv), k * phi_uv)
-                e_neg = torch.polar(torch.ones_like(phi_uv), -k * phi_uv)
-                fourier_phase = torch.polar(
-                    torch.ones_like(phi_uv),
-                    torch.full_like(phi_uv, -k * torch.pi / 2),
-                )
-                anaVis = anaVis + fourier_phase * j_pos * (
-                    coeff_t * e_pos + torch.conj(coeff_t) * e_neg
-                )
 
-            blur = torch.exp(- (torch.pi * self.mrblur_fwhm * 1e-6 / 206265 * rho_uv) ** 2 / (4 * torch.log(torch.tensor(2.0, dtype=uv.dtype, device=uv.device))))
+            x_scale = uv.new_tensor(np.pi * self.d * 1e-6 / 206265.0)
+            x = x_scale * rho_uv
+            anaVis = _bessel_jn(0, x).to(torch.complex64)
+            coeffs = torch.as_tensor(self.coeffs, dtype=anaVis.dtype, device=uv.device)
+            n_coeff = int(coeffs.numel())
+            if n_coeff > 0:
+                j_cache = [_bessel_jn(k, x) for k in range(n_coeff + 1)]
+                ones = torch.ones_like(phi_uv)
+                e_pos_base = torch.polar(ones, phi_uv).to(anaVis.dtype)
+                e_neg_base = torch.conj(e_pos_base)
+                e_pos_k = torch.ones_like(phi_uv, dtype=anaVis.dtype)
+                e_neg_k = torch.ones_like(phi_uv, dtype=anaVis.dtype)
+                fourier_phase = torch.tensor(1 + 0j, dtype=anaVis.dtype, device=uv.device)
+                quarter_turn = torch.tensor(-1j, dtype=anaVis.dtype, device=uv.device)
+
+                for idx in range(n_coeff):
+                    e_pos_k = e_pos_k * e_pos_base
+                    e_neg_k = e_neg_k * e_neg_base
+                    fourier_phase = fourier_phase * quarter_turn
+                    coeff_t = coeffs[idx]
+                    j_pos = j_cache[idx + 1]
+                    anaVis = anaVis + fourier_phase * j_pos * (
+                        coeff_t * e_pos_k + torch.conj(coeff_t) * e_neg_k
+                    )
+
+            blur_scale = uv.new_tensor(np.pi * self.mrblur_fwhm * 1e-6 / 206265.0)
+            log2 = uv.new_tensor(np.log(2.0))
+            blur = torch.exp(-((blur_scale * rho_uv) ** 2) / (4 * log2))
             anaVis = anaVis * self.I0 * blur
             if self.concGaussFlux > 0:
                 anaVis += vis.stretch_vis(uv, lambda uv: vis.circ_gauss(uv, self.concGaussFlux, self.concGaussSigma*1e-6/206265, offset=(0,0)), stretch=stretch)

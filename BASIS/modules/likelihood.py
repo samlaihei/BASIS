@@ -84,6 +84,23 @@ class ModelLikelihood(bilby.Likelihood):
             return torch.as_tensor(x, dtype=dtype, device=like.device)
         return torch.as_tensor(x)
 
+    def _sample_vis_batched(self, model, uv_group, ttype='analytical'):
+        """Evaluate multiple baseline UV tracks in a single model.sample_vis call."""
+        uv_group = np.asarray(uv_group)
+        if uv_group.ndim != 3 or uv_group.shape[1] != 2:
+            raise ValueError("Expected uv_group shape (n_baselines, 2, n_points).")
+
+        n_baselines = uv_group.shape[0]
+        n_points = uv_group.shape[2]
+        uv_stacked = uv_group.transpose(1, 0, 2).reshape(2, n_baselines * n_points)
+        vis_stacked = model.sample_vis(uv_stacked, ttype=ttype)
+
+        if self._is_torch(vis_stacked):
+            return [vis_stacked[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
+
+        vis_arr = np.asarray(vis_stacked)
+        return [vis_arr[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
+
     def _gaussian_loglike(self, data, model_data, sigma):
         if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
             like = model_data if self._is_torch(model_data) else data
@@ -256,9 +273,7 @@ class ModelLikelihood(bilby.Likelihood):
                                 [self.obs.bispec['u2'], self.obs.bispec['v2']],
                                 [self.obs.bispec['u3'], self.obs.bispec['v3']]])
             if parameters is not None:
-                vis1 = model.sample_vis(self.uv[dtype][0, :], ttype=ttype)
-                vis2 = model.sample_vis(self.uv[dtype][1, :], ttype=ttype)
-                vis3 = model.sample_vis(self.uv[dtype][2, :], ttype=ttype)
+                vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 data = vis1 * vis2 * vis3
         
         elif dtype == 'cphase':
@@ -270,9 +285,7 @@ class ModelLikelihood(bilby.Likelihood):
                                 [self.obs.cphase['u2'], self.obs.cphase['v2']],
                                 [self.obs.cphase['u3'], self.obs.cphase['v3']]])
             if parameters is not None:
-                vis1 = model.sample_vis(self.uv[dtype][0, :], ttype=ttype)
-                vis2 = model.sample_vis(self.uv[dtype][1, :], ttype=ttype)
-                vis3 = model.sample_vis(self.uv[dtype][2, :], ttype=ttype)
+                vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 bispec = vis1 * vis2 * vis3
                 data = torch.angle(bispec) if self._is_torch(bispec) else np.angle(bispec)
         
@@ -286,10 +299,7 @@ class ModelLikelihood(bilby.Likelihood):
                                 [self.obs.camp['u3'], self.obs.camp['v3']],
                                 [self.obs.camp['u4'], self.obs.camp['v4']]])
             if parameters is not None:
-                vis1 = model.sample_vis(self.uv[dtype][0, :], ttype=ttype)
-                vis2 = model.sample_vis(self.uv[dtype][1, :], ttype=ttype)
-                vis3 = model.sample_vis(self.uv[dtype][2, :], ttype=ttype)
-                vis4 = model.sample_vis(self.uv[dtype][3, :], ttype=ttype)
+                vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 data = vis1 * vis2 / (vis3 * vis4)
         
         elif dtype == 'logcamp':
@@ -302,10 +312,7 @@ class ModelLikelihood(bilby.Likelihood):
                                 [self.obs.camp['u3'], self.obs.camp['v3']],
                                 [self.obs.camp['u4'], self.obs.camp['v4']]])
             if parameters is not None:
-                vis1 = model.sample_vis(self.uv[dtype][0, :], ttype=ttype)
-                vis2 = model.sample_vis(self.uv[dtype][1, :], ttype=ttype)
-                vis3 = model.sample_vis(self.uv[dtype][2, :], ttype=ttype)
-                vis4 = model.sample_vis(self.uv[dtype][3, :], ttype=ttype)
+                vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 if any(self._is_torch(v) for v in [vis1, vis2, vis3, vis4]):
                     data = torch.log(vis1) + torch.log(vis2) - torch.log(vis3) - torch.log(vis4)
                 else:
@@ -321,9 +328,7 @@ class ModelLikelihood(bilby.Likelihood):
                                 [self.obs.bispec['u2'], self.obs.bispec['v2']],
                                 [self.obs.bispec['u3'], self.obs.bispec['v3']]])
             if parameters is not None:
-                vis1 = model.sample_vis(self.uv[dtype][0, :], ttype=ttype)
-                vis2 = model.sample_vis(self.uv[dtype][1, :], ttype=ttype)
-                vis3 = model.sample_vis(self.uv[dtype][2, :], ttype=ttype)
+                vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 if any(self._is_torch(v) for v in [vis1, vis2, vis3]):
                     advariants = vis1 * torch.conj(vis2).pow(-1) * vis3
                     data = self.advariants_to_ci_torch(advariants, self.obs.bispec['time'])
