@@ -955,12 +955,12 @@ class ModelLikelihood(bilby.Likelihood):
         """
         if invert:
             ci = np.concatenate([ci.real, ci.imag])
-            ci_err = np.concatenate([ci_err.real, ci_err.imag])
+            ci_err = np.concatenate([ci_err, ci_err])
             return ci, ci_err
         else:
             complex_ci = ci[:len(ci)//2] + 1j*ci[len(ci)//2:]
-            complex_ci_err = ci_err[:len(ci_err)//2]
-            return complex_ci, complex_ci_err
+            ci_err = ci_err[:len(ci_err)//2]
+            return complex_ci, ci_err
 
     def add_scans(self, time_array, dt=0.0165, margin=0.0001):
         """
