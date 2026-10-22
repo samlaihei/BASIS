@@ -95,6 +95,8 @@ class ModelLikelihood(bilby.Likelihood):
         self.cached_data = {}
         self.cached_noise = {}
         self.uv = {}
+        if hasattr(self, "_coh_avg_plan_cache"):
+            del self._coh_avg_plan_cache
         return
 
     def replace_obs_vis(self, new_vis, new_sigma, obs_addAll=False):
@@ -657,8 +659,7 @@ class ModelLikelihood(bilby.Likelihood):
         tlist = self.obs.tlist(conj=True)
         if not add_noise:
             N = 1
-        advariants = [[] for i in range(N)]
-        advariants_noise = [[] for i in range(N)]
+
         adv_metadata_dtype = np.dtype([
             ('time', '<f8'),
             ('t1', '<U32'),
@@ -677,6 +678,11 @@ class ModelLikelihood(bilby.Likelihood):
         ])
         adv_metadata_rows = []
         triad_time_dict = {}
+
+        v1s, v2s, v3s = [], [], []
+        s1s, s2s, s3s = [], [], []
+        metadata_entries = []
+
         for tdata in tlist:
             tdata = tdata.astype(self.obs.data.dtype)
             sites = list(set(np.hstack((tdata['t1'], tdata['t2']))))
@@ -685,63 +691,76 @@ class ModelLikelihood(bilby.Likelihood):
             l_dict = {}
             for dat in tdata:
                 l_dict[(dat['t1'], dat['t2'])] = dat
-            
+
             if count == 'max':
                 tris = np.sort(list(it.combinations(sites, 3)))
             else:
                 tris = self.tri_minimal_set(sites, self.obs.tarr, self.obs.tkey)
 
             for tri in tris:
-                for i in range(N):
-                    try:
-                        # Select triangle entries in the data dictionary
-                        l1 = l_dict[(tri[0], tri[1])]
-                        l2 = l_dict[(tri[1], tri[2])]
-                        l3 = l_dict[(tri[2], tri[0])]
-                    except KeyError:
-                        # If any baseline is missing, skip this triangle
+                try:
+                    # Select triangle entries in the data dictionary
+                    l1 = l_dict[(tri[0], tri[1])]
+                    l2 = l_dict[(tri[1], tri[2])]
+                    l3 = l_dict[(tri[2], tri[0])]
+                except KeyError:
+                    # If any baseline is missing, skip this triangle
+                    continue
+
+                triad_time = tdata['time'][0]
+                if tri not in triad_time_dict:
+                    triad_time_dict[tri] = [triad_time]
+                else:
+                    if abs(triad_time - triad_time_dict[tri][-1]) < min_sep_time/3600:
                         continue
+                    triad_time_dict[tri].append(triad_time)
 
-                    triad_time = tdata['time'][0]
-                    if tri not in triad_time_dict:
-                        triad_time_dict[tri] = [triad_time]
-                    else:
-                        if abs(triad_time - triad_time_dict[tri][-1]) < min_sep_time/3600:
-                            continue
-                        triad_time_dict[tri].append(triad_time)
-                    v1, v2, v3 = l1['vis'], l2['vis'], l3['vis']
-                    s1, s2, s3 = l1['sigma'], l2['sigma'], l3['sigma']
-                    
-                    if add_noise:
-                        v1 += (np.random.normal(0, s1) + 1j * np.random.normal(0, s1))
-                        v2 += (np.random.normal(0, s2) + 1j * np.random.normal(0, s2))
-                        v3 += (np.random.normal(0, s3) + 1j * np.random.normal(0, s3))
+                v1s.append(l1['vis'])
+                v2s.append(l2['vis'])
+                v3s.append(l3['vis'])
+                s1s.append(l1['sigma'])
+                s2s.append(l2['sigma'])
+                s3s.append(l3['sigma'])
+                metadata_entries.append((
+                    triad_time,
+                    tri[0],
+                    tri[1],
+                    tri[2],
+                    l1['u'],
+                    l1['v'],
+                    l2['u'],
+                    l2['v'],
+                    l3['u'],
+                    l3['v'],
+                ))
 
-                    adv = v1 * np.conj(v2)**(-1) * v3
-                    adv_noise = np.sqrt((s1/np.abs(v1))**2 + (s2/np.abs(v2))**2 + (s3/np.abs(v3))**2) * np.abs(adv)
-                    advariants[i].append(adv)
-                    advariants_noise[i].append(adv_noise)
-                    adv_metadata_rows.append((
-                        triad_time,
-                        tri[0],
-                        tri[1],
-                        tri[2],
-                        l1['u'],
-                        l1['v'],
-                        l2['u'],
-                        l2['v'],
-                        l3['u'],
-                        l3['v'],
-                        adv,
-                        adv_noise,
-                        np.nan,
-                        np.nan
-                    ))
-                    
+        if len(v1s) == 0:
+            advariants = np.empty((N, 0), dtype=np.complex128)
+            advariants_noise = np.empty((N, 0), dtype=np.float64)
+            adv_metadata = np.array(adv_metadata_rows, dtype=adv_metadata_dtype)
+            return np.squeeze(advariants), np.squeeze(advariants_noise)/np.sqrt(2), adv_metadata
 
+        v1, v2, v3 = [np.asarray(x, dtype=np.complex128) for x in (v1s, v2s, v3s)]
+        s1, s2, s3 = [np.asarray(x, dtype=np.float64) for x in (s1s, s2s, s3s)]
 
-        advariants = np.squeeze(np.array(advariants).reshape(N, -1))
-        advariants_noise = np.squeeze(np.array(advariants_noise).reshape(N, -1))/np.sqrt(2)
+        if add_noise:
+            noise_v1, noise_v2, noise_v3 = [np.random.normal(0, s, size=(N, len(v))) + 1j * np.random.normal(0, s, size=(N, len(v))) for s, v in zip((s1, s2, s3), (v1, v2, v3))]
+            v1, v2, v3 = v1[None, :] + noise_v1, v2[None, :] + noise_v2, v3[None, :] + noise_v3
+
+        adv = v1 * np.conj(v2)**(-1) * v3
+        adv_noise = np.sqrt((s1[None, :] / np.abs(v1))**2 + (s2[None, :] / np.abs(v2))**2 + (s3[None, :] / np.abs(v3))**2) * np.abs(adv)
+
+        advariants = np.asarray(adv, dtype=np.complex128)
+        advariants_noise = np.asarray(adv_noise, dtype=np.float64)
+        adv0 = advariants[0] if advariants.ndim > 1 else advariants
+        adv_noise0 = advariants_noise[0] if advariants_noise.ndim > 1 else advariants_noise
+        advariants = np.squeeze(np.asarray(advariants).reshape(N, -1))
+        advariants_noise = np.squeeze(np.asarray(advariants_noise).reshape(N, -1)) / np.sqrt(2)
+
+        adv_metadata_rows = [
+            (*entry, adv0[idx], adv_noise0[idx], np.nan, np.nan)
+            for idx, entry in enumerate(metadata_entries)
+        ]
         adv_metadata = np.array(adv_metadata_rows, dtype=adv_metadata_dtype)
 
         return advariants, advariants_noise, adv_metadata
@@ -755,59 +774,85 @@ class ModelLikelihood(bilby.Likelihood):
         Parameters
         ----------
         advariants : np.ndarray
-            The advariants to normalise.
+            The advariants to normalise. May be a single 1D array of length M or a
+            stacked 2D array of shape (N, M) for multiple noise realisations.
         times : np.ndarray
-            The times corresponding to the advariants.
+            The times corresponding to the advariants. Must be 1D with length M.
         advariants_noise : np.ndarray, optional
-            The noise associated with the advariants.
+            The noise associated with the advariants. Must match the shape of advariants.
 
         Returns
         -------
         real_valued_advariants : np.ndarray
-            The normalised closure invariants.
+            The normalised closure invariants, preserving the input sample shape.
         real_valued_advariants_noise : np.ndarray
-            The normalised closure invariants noise.
+            The normalised closure invariants noise, if requested.
         """
-        unique_times = np.unique(times)
+        advariants = np.asarray(advariants)
+        squeeze_output = False
+        if advariants.ndim == 1:
+            advariants = advariants[np.newaxis, :]
+            squeeze_output = True
+        elif advariants.ndim != 2:
+            raise ValueError("advariants must be 1D or 2D")
+
+        times = np.asarray(times)
+        if times.ndim != 1 or times.shape[0] != advariants.shape[1]:
+            raise ValueError("times must be 1D with the same length as the advariant samples")
+
+        if advariants_noise is not None:
+            advariants_noise = np.asarray(advariants_noise)
+            if advariants_noise.ndim == 1:
+                advariants_noise = advariants_noise[np.newaxis, :]
+            if advariants_noise.shape != advariants.shape:
+                raise ValueError("advariants_noise must match the shape of advariants")
+
         time_axis = np.concatenate([times, times], axis=0)
-        real_valued_advariants = np.concatenate([np.real(advariants), np.imag(advariants)], axis=0)
-        if advariants_noise is not None:
-            real_valued_advariants_noise = np.concatenate([advariants_noise, advariants_noise], axis=0)
-        
-        norms_dict = {}
-        norms_noise_dict = {}
+        real_valued_advariants = np.concatenate([advariants.real, advariants.imag], axis=1)
 
-        for t in unique_times:
+        if advariants_noise is not None:
+            real_valued_advariants_noise = np.concatenate([advariants_noise, advariants_noise], axis=1)
+
+        unique_times = np.unique(times)
+        norm_per_time = np.empty((advariants.shape[0], len(unique_times)), dtype=float)
+        norm_noise_per_time = np.empty((advariants.shape[0], len(unique_times)), dtype=float) if advariants_noise is not None else None
+
+        for j, t in enumerate(unique_times):
             mask = (time_axis == t)
-            values = real_valued_advariants[mask]
-            
-            sum_norm_p = np.sum(np.abs(values)**self.normpower)
-            norm = sum_norm_p**(1/self.normpower)
-            norms_dict[t] = norm
-            
-            if advariants_noise is not None:
-                sigmas = real_valued_advariants_noise[mask]
-                dnorm_dx = (np.abs(values)**(self.normpower-1) * np.sign(values) / 
-                            sum_norm_p**(1 - 1/self.normpower))
-                
-                norm_variance = np.sum((dnorm_dx * sigmas)**2)
-                norms_noise_dict[t] = np.sqrt(norm_variance)
+            values = real_valued_advariants[:, mask]
+            sum_norm_p = np.sum(np.abs(values)**self.normpower, axis=1)
+            norm_per_time[:, j] = sum_norm_p**(1/self.normpower)
 
-        for i, t in enumerate(time_axis):
-            norm = norms_dict[t]
-            value_unnormalized = real_valued_advariants[i]
-            real_valued_advariants[i] /= norm
-            
             if advariants_noise is not None:
-                sigma_x = real_valued_advariants_noise[i]
-                sigma_norm = norms_noise_dict[t]
-                variance = (sigma_x / norm)**2 + (value_unnormalized * sigma_norm / norm**2)**2
-                real_valued_advariants_noise[i] = np.sqrt(variance)
+                sigmas = real_valued_advariants_noise[:, mask]
+                dnorm_dx = (np.abs(values)**(self.normpower - 1) * np.sign(values) /
+                            sum_norm_p[:, None]**(1 - 1/self.normpower))
+                norm_noise_per_time[:, j] = np.sqrt(np.sum((dnorm_dx * sigmas)**2, axis=1))
+
+        norm_map = np.empty_like(real_valued_advariants)
+        for j, t in enumerate(unique_times):
+            mask = (time_axis == t)
+            norm_map[:, mask] = norm_per_time[:, j:j+1]
+
+        real_valued_advariants_norm = real_valued_advariants / norm_map
 
         if advariants_noise is not None:
-            return real_valued_advariants, real_valued_advariants_noise
-        
-        return real_valued_advariants, None
+            real_valued_advariants_noise_norm = np.empty_like(real_valued_advariants_noise)
+            for j, t in enumerate(unique_times):
+                mask = (time_axis == t)
+                value_unnormalized = real_valued_advariants[:, mask]
+                sigma_x = real_valued_advariants_noise[:, mask]
+                sigma_norm = norm_noise_per_time[:, j:j+1]
+                norm = norm_per_time[:, j:j+1]
+                variance = (sigma_x / norm)**2 + (value_unnormalized * sigma_norm / norm**2)**2
+                real_valued_advariants_noise_norm[:, mask] = np.sqrt(variance)
+            if squeeze_output:
+                return real_valued_advariants_norm[0], real_valued_advariants_noise_norm[0]
+            return real_valued_advariants_norm, real_valued_advariants_noise_norm
+
+        if squeeze_output:
+            return real_valued_advariants_norm[0], None
+        return real_valued_advariants_norm, None
     
     
     def estimate_noise_ci(self, N=1000): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
@@ -820,18 +865,11 @@ class ModelLikelihood(bilby.Likelihood):
         """
 
         advariants_noisy, _, adv_metadata = self.calc_advariants(N=N, add_noise=True, count=self.count)
-        ci_times = adv_metadata['time']
-
-        ci_noisy_samples = []
-        for i in range(N):
-            ci_noisy = self.advariants_to_ci(advariants_noisy[i], ci_times)[0]
-            ci_noisy_samples.append(ci_noisy)
-        ci_noisy_samples = np.array(ci_noisy_samples)
-
+        ci_noisy_samples, _ = self.advariants_to_ci(advariants_noisy, adv_metadata['time'])
         sigma_ci = np.std(ci_noisy_samples, axis=0)
         return sigma_ci
 
-    def plot_all(self, parameters=None, save_path=None, avg_time=None, scan_avg=None):
+    def plot_all(self, parameters=None, save_path=None, avg_time=None, scan_avg=None, fig=None, axs=None, color='b'):
         """Plot the data and model for all data types.
 
         Parameters
@@ -844,6 +882,12 @@ class ModelLikelihood(bilby.Likelihood):
             The averaging time for the data (default is None).
         scan_avg : bool, optional
             Whether to perform scan averaging (default is None).
+        fig : matplotlib.figure.Figure, optional
+            The figure to plot on (default is None, which creates a new figure).
+        axs : np.ndarray, optional
+            The axes to plot on (default is None, which creates new axes).
+        color : str, optional
+            The color for the plot (default is 'b').
         """
         import matplotlib.pyplot as plt
 
@@ -852,7 +896,8 @@ class ModelLikelihood(bilby.Likelihood):
         if scan_avg is None:
             scan_avg = self.scan_avg
 
-        fig, axs = plt.subplots(2, 4, figsize=(16,12))
+        if fig is None or axs is None or axs.shape != (2, 4):
+            fig, axs = plt.subplots(2, 4, figsize=(16,12))
         errorbar_alpha = 0.4
 
         dterms = {'Visibility Amplitude': 'visamp', 'Visibility Phase': 'vis', 'Bispectrum Amplitude': 'bispec',
@@ -883,7 +928,7 @@ class ModelLikelihood(bilby.Likelihood):
                 if title == 'Closure Invariants Phase':
                     sigma = np.real(sigma/np.abs(data))  # phase error approximation
                 
-            axs[i%2, i//2].errorbar(uvdist, ops[title](data), yerr=sigma, fmt='o', color='blue', markersize=0, capsize=1, alpha=errorbar_alpha, label='Data')
+            axs[i%2, i//2].errorbar(uvdist, ops[title](data), yerr=sigma, fmt='o', color=color, markersize=0, capsize=1, alpha=errorbar_alpha, label='Data')
             if parameters is not None:
                 axs[i%2, i//2].scatter(uvdist, ops[title](model_data), color='red', s=5, label='Model')
             axs[i%2, i//2].set_title(title)
@@ -1053,7 +1098,7 @@ class ModelLikelihood(bilby.Likelihood):
         plan_key = (float(avg_time), bool(scan_avg), float(dt), float(margin))
         plan = self._coh_avg_plan_cache.get(plan_key)
 
-        # ---------- build plan if cache miss ----------
+        # ---------- build plan if signature not in cache ----------
         if plan is None:
             all_time = data_array['time']
 
