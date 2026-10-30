@@ -28,10 +28,10 @@ def _batch_image(image):
     return np.expand_dims(image, 0)
 
 MODEL_LIST = {'point': point.point, 'disk':disk.disk, 'gauss':gauss.gauss, 'sdisk':sdisk.sdisk,
-              'ring': ring.ring, 'xsring':xsring.xsring, 'xsringauss':xsringauss.xsringauss,
+              'ring':ring.ring, 'xsring':xsring.xsring, 'xsringauss':xsringauss.xsringauss,
             'mring': mring.mring, 'mgring': mgring.mgring, 'pixelgrid': pixelgrid.pixelgrid}
-MODEL_PARAMS = {'point': point.MODEL_PARAMS, 'disk': disk.MODEL_PARAMS, 'gauss': gauss.MODEL_PARAMS, 'sdisk': sdisk.MODEL_PARAMS,
-                   'ring': ring.MODEL_PARAMS, 'xsring': xsring.MODEL_PARAMS, 'xsringauss': xsringauss.MODEL_PARAMS, 
+MODEL_PARAMS = {'point': point.MODEL_PARAMS, 'disk': disk.MODEL_PARAMS, 'gauss': gauss.MODEL_PARAMS, 'ring': ring.MODEL_PARAMS, 'sdisk': sdisk.MODEL_PARAMS,
+                   'xsring': xsring.MODEL_PARAMS, 'xsringauss': xsringauss.MODEL_PARAMS, 
                 'mring': mring.MODEL_PARAMS, 'mgring': mgring.MODEL_PARAMS, 'pixelgrid': pixelgrid.MODEL_PARAMS}
 
 
@@ -313,6 +313,24 @@ class BaseModel(object):
             self.params[key] = value
         
 
+    def _components(self):
+        """Construct components using a cached mapping of parameter names."""
+        signature = (tuple(self.model_list), tuple(self.params))
+        if getattr(self, '_component_signature', None) != signature:
+            specs = []
+            for ind, model_name in enumerate(self.model_list):
+                prefix = f"{ind}_"
+                keys = [(key, key[len(prefix):]) for key in self.params if key.startswith(prefix)]
+                if {name for key, name in keys} != set(_params_for_model(model_name)):
+                    raise ValueError(f"Parameters for model {model_name} are incomplete.")
+                specs.append((MODEL_LIST[_resolve_model_name(model_name)], keys))
+            self._component_specs = specs
+            self._component_signature = signature
+
+        for factory, keys in self._component_specs:
+            params = {name: self.params[key] for key, name in keys}
+            yield factory(dim=self.dim, fov=self.fov, **params)
+
     def sky_map(self, params=None):
         """Generates the combined sky map from all models.
 
@@ -322,13 +340,7 @@ class BaseModel(object):
         image = None
         if params is not None:
             self.set_params(params)
-        for ind, model_name in enumerate(self.model_list):
-            model_params = {key.split('_', 1)[1]: value for key, value in self.params.items() if key.startswith(f"{ind}_")}
-            required_params = set(_params_for_model(model_name))
-            if set(model_params.keys()) != required_params:
-                raise ValueError(f"Parameters for model {model_name} do not match required parameters.")                    
-            model_key = _resolve_model_name(model_name)
-            model_instance = MODEL_LIST[model_key](dim=self.dim, fov=self.fov, **model_params)
+        for model_instance in self._components():
             model_image = model_instance.sky_map()
             if image is None:
                 image = torch.zeros_like(model_image) if torch.is_tensor(model_image) else np.zeros_like(model_image)
@@ -363,18 +375,12 @@ class BaseModel(object):
         
         else:
             avis = torch.zeros(nvis, dtype=torch.complex64, device=uv_t.device)
-            for ind, model_name in enumerate(self.model_list):
-                model_params = {key.split('_', 1)[1]: value for key, value in self.params.items() if key.startswith(f"{ind}_")}
-                required_params = set(_params_for_model(model_name))
-                if set(model_params.keys()) != required_params:
-                    raise ValueError(f"Parameters for model {model_name} are incomplete.")
-                model_key = _resolve_model_name(model_name)
-                model_instance = MODEL_LIST[model_key](dim=self.dim, fov=self.fov, **model_params)
+            for model_instance in self._components():
                 mvis = torch.as_tensor(model_instance.sample_vis(uv, ttype=ttype), device=uv_t.device)
                 mvis = mvis.reshape(-1).to(avis.dtype)
                 if mvis.numel() != nvis:
                     raise ValueError(
-                        f"Model {model_name} returned {mvis.numel()} visibilities, expected {nvis}."
+                        f"Model {type(model_instance).__name__} returned {mvis.numel()} visibilities, expected {nvis}."
                     )
                 avis = avis + mvis
             return avis

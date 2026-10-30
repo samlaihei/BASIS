@@ -126,8 +126,7 @@ class mring(object):
             self.coeffs = np.array([m * np.exp(1j * p) for m, p in zip(self.coeff_magnitudes, self.coeff_phases)])
         
 
-        self.X = np.linspace(-self.fov/2, self.fov/2,self.dim)
-        self.Y = np.linspace(-self.fov/2, self.fov/2,self.dim)
+        self.X, self.Y = utils.image_axes(self.dim, self.fov)
         self.psize = (self.X[1]-self.X[0])
         
 

@@ -105,8 +105,7 @@ class xsringauss(object):
         self.a = self.gax * self.Rp
         self.b = self.aq*self.a
         
-        self.X = np.linspace(-self.fov/2, self.fov/2,self.dim)
-        self.Y = np.linspace(-self.fov/2, self.fov/2,self.dim)
+        self.X, self.Y = utils.image_axes(self.dim, self.fov)
         self.psize = (self.X[1]-self.X[0])
     
     def floor_component(self):

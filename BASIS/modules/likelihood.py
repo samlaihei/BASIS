@@ -4,12 +4,11 @@ import bilby
 import numpy as np
 import torch
 import itertools as it
-import pandas as pd
 
 class ModelLikelihood(bilby.Likelihood):
     def __init__(self, obs, model_names=None, img=None, imgdim=128, fov=225, count='min',  dterms={'vis':100},
-                 static_noise_floor=0, noise_frac=0, noise_factor=1, avg_time=0, scan_avg=False,
-                 obs_addAll=True):
+                 static_noise_floor=0, noise_frac=0, noise_factor=1, avg_time=0, scan_avg=False, uvdist_sections=None,
+                 obs_addAll=True, ci_cov=False):
         """Initialize the ModelLikelihood class.
 
         Parameters
@@ -36,6 +35,8 @@ class ModelLikelihood(bilby.Likelihood):
             Whether to add all data terms to the obs data table (default is True).
         dterms : dict, optional
             The data terms to include in the likelihood and their weighting (default is visibility data).
+        ci_cov : bool, optional
+            Whether to compute and use the covariance for closure invariants (default is False).
         """
 
         super().__init__()
@@ -50,6 +51,7 @@ class ModelLikelihood(bilby.Likelihood):
         self.img = img
         self.avg_time = avg_time
         self.scan_avg = scan_avg
+        self.uvdist_sections = uvdist_sections
 
         if obs_addAll:
             try:
@@ -67,6 +69,7 @@ class ModelLikelihood(bilby.Likelihood):
         self.uv = {}
 
         self.dterms = dterms
+        self.ci_cov = ci_cov
 
         # Closure invariants
         self.normpower = 2
@@ -91,12 +94,45 @@ class ModelLikelihood(bilby.Likelihood):
             return torch.as_tensor(x, dtype=dtype, device=like.device)
         return torch.as_tensor(x)
 
+    @staticmethod
+    def _to_numpy(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    @staticmethod
+    def _compute_cov(data):
+        # Given data in shape (n_samples, n_features), compute the covariance matrix.
+        data = np.asarray(data)
+        if data.ndim != 2:
+            raise ValueError("Expected data to be a 2D array with shape (n_samples, n_features).")
+        return np.cov(data, rowvar=False)
+
+    @staticmethod
+    def _compute_logcovdet(cov):
+        cov = np.asarray(cov)
+        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+            raise ValueError("Expected cov to be a 2D square matrix.")
+        sign, logdet = np.linalg.slogdet(cov)
+        if sign <= 0:
+            raise ValueError("Covariance matrix must be positive definite.")
+        return logdet
+
+    @staticmethod
+    def _compute_invcov(cov):
+        cov = np.asarray(cov)
+        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+            raise ValueError("Expected cov to be a 2D square matrix.")
+        return np.linalg.inv(cov)
+
     def clear_cached_data(self):
         self.cached_data = {}
         self.cached_noise = {}
         self.uv = {}
-        if hasattr(self, "_coh_avg_plan_cache"):
-            del self._coh_avg_plan_cache
+        for name in ('_coh_avg_plan_cache', '_ci_group_cache', '_uv_plan_cache',
+                     '_gaussian_norm_cache', '_uv_mask_cache'):
+            if hasattr(self, name):
+                delattr(self, name)
         return
 
     def replace_obs_vis(self, new_vis, new_sigma, obs_addAll=False):
@@ -130,21 +166,33 @@ class ModelLikelihood(bilby.Likelihood):
         return 
 
     def _sample_vis_batched(self, model, uv_group, ttype='analytical'):
-        """Evaluate multiple baseline UV tracks in a single model.sample_vis call."""
+        """Sample distinct UV coordinates once, then restore each baseline track."""
         uv_group = np.asarray(uv_group)
         if uv_group.ndim != 3 or uv_group.shape[1] != 2:
             raise ValueError("Expected uv_group shape (n_baselines, 2, n_points).")
 
         n_baselines = uv_group.shape[0]
         n_points = uv_group.shape[2]
-        uv_stacked = uv_group.transpose(1, 0, 2).reshape(2, n_baselines * n_points)
-        vis_stacked = model.sample_vis(uv_stacked, ttype=ttype)
+        if not hasattr(self, '_uv_plan_cache'):
+            self._uv_plan_cache = {}
+        key = id(uv_group)
+        plan = self._uv_plan_cache.get(key)
+        if plan is None or not np.array_equal(plan[0], uv_group):
+            uv_stacked = uv_group.transpose(1, 0, 2).reshape(2, -1)
+            unique_uv, inverse = np.unique(uv_stacked.T, axis=0, return_inverse=True)
+            plan = (uv_group.copy(), unique_uv.T.copy(), inverse)
+            # One plan per shape bounds memory for callers supplying fresh arrays.
+            self._uv_plan_cache = {k: v for k, v in self._uv_plan_cache.items()
+                                   if v[0].shape != uv_group.shape}
+            self._uv_plan_cache[key] = plan
 
-        if self._is_torch(vis_stacked):
-            return [vis_stacked[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
-
-        vis_arr = np.asarray(vis_stacked)
-        return [vis_arr[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
+        vis_unique = model.sample_vis(plan[1], ttype=ttype)
+        if self._is_torch(vis_unique):
+            inverse = torch.as_tensor(plan[2], device=vis_unique.device)
+            vis_stacked = vis_unique[inverse]
+        else:
+            vis_stacked = np.asarray(vis_unique)[plan[2]]
+        return [vis_stacked[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
 
     def _gaussian_loglike(self, data, model_data, sigma):
         if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
@@ -154,8 +202,32 @@ class ModelLikelihood(bilby.Likelihood):
             residual_t = data_t - model_t
             sigma_t = self._to_torch(sigma, like=residual_t, complex_ok=False)
             return -0.5 * torch.sum(torch.abs(residual_t / sigma_t) ** 2 + torch.log(2 * torch.pi * sigma_t ** 2))
+        sigma = np.asarray(sigma)
+        if not hasattr(self, '_gaussian_norm_cache'):
+            self._gaussian_norm_cache = {}
+        key = (sigma.shape, sigma.dtype.str)
+        cached = self._gaussian_norm_cache.get(key)
+        if cached is None or not np.array_equal(cached[0], sigma):
+            cached = (sigma.copy(), np.log(2 * np.pi * sigma**2))
+            self._gaussian_norm_cache[key] = cached
         residual = data - model_data
-        return -0.5 * np.sum(np.abs((residual / sigma) ** 2) + np.log(2 * np.pi * sigma ** 2))
+        return -0.5 * np.sum(np.abs((residual / sigma)**2) + cached[1])
+
+    def _covariance_loglike(self, data, model_data, logcovdet, invcov):
+        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(logcovdet) or self._is_torch(invcov):
+            like = model_data if self._is_torch(model_data) else data
+            data_t = self._to_torch(data, like=like, complex_ok=True)
+            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+            residual_t = data_t - model_t
+            logcovdet_t = self._to_torch(logcovdet, like=residual_t, complex_ok=False)
+            invcov_t = self._to_torch(invcov, like=residual_t, complex_ok=False)
+            x_t = torch.matmul(invcov_t, residual_t)
+            chi2_t = torch.sum(residual_t.conj() * x_t).real
+            return -0.5 * (chi2_t + logcovdet_t + data_t.numel() * np.log(2 * np.pi))
+        residual = data - model_data
+        x = np.matmul(invcov, residual)
+        chi2 = np.vdot(residual, x).real
+        return -0.5 * (chi2 + logcovdet + np.size(data) * np.log(2 * np.pi))
 
     def _gaussian_redchi2(self, data, model_data, sigma):
         if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
@@ -168,18 +240,18 @@ class ModelLikelihood(bilby.Likelihood):
         residual = data - model_data
         return np.sum(np.abs(residual / sigma) ** 2)/len(data)
 
-    def _covariance_redchi2(self, data, model_data, cov):
-        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(cov):
+    def _covariance_redchi2(self, data, model_data, invcov):
+        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(invcov):
             like = model_data if self._is_torch(model_data) else data
             data_t = self._to_torch(data, like=like, complex_ok=True)
             model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
             residual_t = data_t - model_t
-            cov_t = self._to_torch(cov, like=residual_t, complex_ok=False)
-            x_t = torch.linalg.solve(cov_t, residual_t)
+            invcov_t = self._to_torch(invcov, like=residual_t, complex_ok=False)
+            x_t = torch.matmul(invcov_t, residual_t)
             chi2_t = torch.sum(residual_t.conj() * x_t).real
             return chi2_t / len(data)
         residual = data - model_data
-        x = np.linalg.solve(cov, residual)
+        x = np.matmul(invcov, residual)
         chi2 = np.vdot(residual, x).real 
         return chi2 / len(data)
 
@@ -188,17 +260,12 @@ class ModelLikelihood(bilby.Likelihood):
         advariants_t = self._to_torch(advariants, complex_ok=True)
         times_t = self._to_torch(times, like=advariants_t.real)
 
-        time_axis = torch.cat([times_t, times_t], dim=0)
         values = torch.cat([advariants_t.real, advariants_t.imag], dim=0)
-        out = torch.empty_like(values)
-
-        for t in torch.unique(times_t):
-            mask = (time_axis == t)
-            vals_t = values[mask]
-            norm = torch.sum(torch.abs(vals_t) ** self.normpower).pow(1.0 / self.normpower)
-            out[mask] = vals_t / norm
-
-        return out
+        _, groups = torch.unique(times_t, return_inverse=True)
+        groups = torch.cat([groups, groups])
+        sums = torch.zeros_like(times_t).scatter_add(0, groups, torch.abs(values)**self.normpower)
+        norms = sums.pow(1.0 / self.normpower)
+        return values / norms[groups]
 
 
     def get_model(self, parameters):
@@ -249,31 +316,29 @@ class ModelLikelihood(bilby.Likelihood):
             The total log-likelihood.
         """
         lnlike = 0
+        dterm_func = {'image': self.log_likelihood_image,
+                      'vis': self.log_likelihood_vis,
+                      'visamp': self.log_likelihood_visamp,
+                      'bispec': self.log_likelihood_bispec,
+                      'cphase': self.log_likelihood_cphase,
+                      'camp': self.log_likelihood_camp,
+                      'logcamp': self.log_likelihood_logcamp,
+                      'ci': self.log_likelihood_ci}
+        
         for dterm, weight in self.dterms.items():
             add_lnlike = 0
-            if dterm == 'image' and self.img is not None:
-                add_lnlike = self.log_likelihood_image(parameters)
-            elif dterm == 'vis':
-                add_lnlike = self.log_likelihood_vis(parameters)
-            elif dterm == 'visamp':
-                add_lnlike = self.log_likelihood_visamp(parameters)
-            elif dterm == 'bispec':
-                add_lnlike = self.log_likelihood_bispec(parameters)
-            elif dterm == 'cphase':
-                add_lnlike = self.log_likelihood_cphase(parameters)
-            elif dterm == 'camp':
-                add_lnlike = self.log_likelihood_camp(parameters)
-            elif dterm == 'logcamp':
-                add_lnlike = self.log_likelihood_logcamp(parameters)
-            elif dterm == 'ci':
-                add_lnlike = self.log_likelihood_ci(parameters)
+            loglike_func = dterm_func.get(dterm, None)
+            invcov = self.cached_noise.get('invcov'+dterm, None)
+            logcovdet = self.cached_noise.get('logcovdet'+dterm, None)
+            if loglike_func is not None:
+                add_lnlike = loglike_func(parameters, invcov=invcov, logcovdet=logcovdet)
 
             add_lnlike *= weight/100
             lnlike += add_lnlike
         return lnlike
 
     def sample_data(self, parameters=None, dtype='vis', ttype='analytical', min_sep_time=0,
-                    avg_time=None, scan_avg=None):
+                    avg_time=None, scan_avg=None, uvdist_sections=None):
         """Sample the model data for the given parameters and data type.
         
         Parameters
@@ -294,6 +359,8 @@ class ModelLikelihood(bilby.Likelihood):
             The averaging time in seconds for the data. Default is self.avg_time.
         scan_avg : bool, optional
             Whether to perform scan averaging. Default is self.scan_avg.
+        uvdist_sections : list of float, optional
+            The sections of the uvdist to consider. Default is self.uvdist_sections.
 
         Returns
         -------
@@ -314,6 +381,8 @@ class ModelLikelihood(bilby.Likelihood):
             self.scan_avg = scan_avg
             self.avg_time = avg_time
             self.clear_cached_data()
+        if uvdist_sections is None:
+            uvdist_sections = self.uvdist_sections
         
         data = None
     
@@ -343,8 +412,14 @@ class ModelLikelihood(bilby.Likelihood):
                 self.cached_noise['sigma'+dtype] = temp_obsdata['sigma']
                 self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
                 self.uv[dtype] = np.array([temp_obsdata['u'], temp_obsdata['v']])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+
             if parameters is not None:
                 data = model.sample_vis(self.uv[dtype], ttype=ttype)
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
             
         elif dtype == 'visamp':
             if dtype not in self.cached_data:                
@@ -353,9 +428,15 @@ class ModelLikelihood(bilby.Likelihood):
                 self.cached_noise['sigma'+dtype] = obsdata['sigma']
                 self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
                 self.uv[dtype] = np.array([obsdata['u'], obsdata['v']])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+
             if parameters is not None:
                 vis_data = model.sample_vis(self.uv[dtype], ttype=ttype)
                 data = torch.abs(vis_data) if self._is_torch(vis_data) else np.abs(vis_data)
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
         
         elif dtype == 'bispec':
             if dtype not in self.cached_data:
@@ -366,9 +447,15 @@ class ModelLikelihood(bilby.Likelihood):
                 self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
                                 [obsdata['u2'], obsdata['v2']],
                                 [obsdata['u3'], obsdata['v3']]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+            
             if parameters is not None:
                 vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 data = vis1 * vis2 * vis3
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
         
         elif dtype == 'cphase':
             if dtype not in self.cached_data:
@@ -379,10 +466,16 @@ class ModelLikelihood(bilby.Likelihood):
                 self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
                                 [obsdata['u2'], obsdata['v2']],
                                 [obsdata['u3'], obsdata['v3']]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+
             if parameters is not None:
                 vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 bispec = vis1 * vis2 * vis3
                 data = torch.angle(bispec) if self._is_torch(bispec) else np.angle(bispec)
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
         
         elif dtype == 'camp':
             if dtype not in self.cached_data:
@@ -394,9 +487,15 @@ class ModelLikelihood(bilby.Likelihood):
                                 [obsdata['u2'], obsdata['v2']],
                                 [obsdata['u3'], obsdata['v3']],
                                 [obsdata['u4'], obsdata['v4']]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+
             if parameters is not None:
                 vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 data = vis1 * vis2 / (vis3 * vis4)
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
         
         elif dtype == 'logcamp':
             if dtype not in self.cached_data:
@@ -408,40 +507,127 @@ class ModelLikelihood(bilby.Likelihood):
                                 [obsdata['u2'], obsdata['v2']],
                                 [obsdata['u3'], obsdata['v3']],
                                 [obsdata['u4'], obsdata['v4']]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+
             if parameters is not None:
                 vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 if any(self._is_torch(v) for v in [vis1, vis2, vis3, vis4]):
                     data = torch.log(vis1) + torch.log(vis2) - torch.log(vis3) - torch.log(vis4)
                 else:
                     data = np.log(vis1) + np.log(vis2) - np.log(vis3) - np.log(vis4)
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[mask]
         
         elif dtype == 'ci':
             if dtype not in self.cached_data:
                 adv, adv_noise, adv_metadata = self.calc_advariants(count=self.count, min_sep_time=min_sep_time)
                 real_ci, real_ci_sigma = self.advariants_to_ci(adv, adv_metadata['time'], adv_noise)
-                # real_ci_sigma = self.estimate_noise_ci() # MC-style estimation of CI noise, assuming independent Gaussian noise on visibilities
-
+                if self.ci_cov:
+                    noisy_adv, _, noisy_meta = self.calc_advariants(
+                        N=max(1000, 5 * real_ci.size), add_noise=True,
+                        count=self.count, min_sep_time=min_sep_time)
+                    ci_samples, _ = self.advariants_to_ci(noisy_adv, noisy_meta['time'])
                 adv_metadata['ci'], adv_metadata['sigma_ci'] = self.ci_real_to_complex(real_ci, real_ci_sigma)
-                self.ci = adv_metadata
-                self.ci = self.coh_avg_ndarray(self.ci, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype], self.cached_noise['sigma'+dtype] = self.ci_real_to_complex(self.ci['ci'], self.ci['sigma_ci'], invert=True)
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
+                self.ci = self.coh_avg_ndarray(adv_metadata, avg_time=avg_time, scan_avg=scan_avg)
+                n = len(adv_metadata)
+                self._ci_raw_metadata = adv_metadata
+                self._ci_average = None
+                if avg_time > 0 or scan_avg:
+                    self._ci_average = self._ci_averaging_matrix(n, avg_time, scan_avg)
+                    average = self._ci_average
+                    average_squared = average**2
+                    # Independent-error approximation for the analytical path.
+                    real_ci_sigma = np.sqrt(np.concatenate([
+                        average_squared @ real_ci_sigma[:n]**2,
+                        average_squared @ real_ci_sigma[n:]**2]))
+                    if self.ci_cov:
+                        ci_samples = np.concatenate([ci_samples[:, :n] @ average.T,
+                                                     ci_samples[:, n:] @ average.T], axis=1)
+                self.cached_data[dtype] = np.concatenate([self.ci['ci'].real, self.ci['ci'].imag])
                 self.uv[dtype] = np.array([[self.ci['u1'], self.ci['v1']],
-                                [self.ci['u2'], self.ci['v2']],
-                                [self.ci['u3'], self.ci['v3']]])
+                                         [self.ci['u2'], self.ci['v2']],
+                                         [self.ci['u3'], self.ci['v3']]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                mask = np.concatenate([mask, mask])
+                self.cached_data[dtype] = self.cached_data[dtype][mask]
+                if self.ci_cov:
+                    ci_samples = ci_samples[:, mask]
+                    cov = np.atleast_2d(np.cov(ci_samples, rowvar=False))
+                    sigma = np.sqrt(np.diag(cov))
+                    self._cache_ci_covariance(cov, self.cached_data[dtype])
+                else:
+                    sigma = real_ci_sigma[mask]
+                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], sigma)
+
+                # Model evaluations reuse the original UV coordinates.
+                self._ci_raw_uv = np.array([[adv_metadata['u1'], adv_metadata['v1']],
+                                           [adv_metadata['u2'], adv_metadata['v2']],
+                                           [adv_metadata['u3'], adv_metadata['v3']]])
 
             if parameters is not None:
-                vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
+                metadata = self._ci_raw_metadata
+                n = len(metadata)
+                vis1, vis2, vis3 = self._sample_vis_batched(model, self._ci_raw_uv, ttype=ttype)
                 if any(self._is_torch(v) for v in [vis1, vis2, vis3]):
                     advariants = vis1 * torch.conj(vis2).pow(-1) * vis3
-                    data = self.advariants_to_ci_torch(advariants, self.ci['time'])
+                    data = self.advariants_to_ci_torch(advariants, metadata['time'])
                 else:
                     advariants = vis1 * np.conj(vis2)**(-1) * vis3
-                    data = self.advariants_to_ci(advariants, self.ci['time'])[0]
+                    data = self.advariants_to_ci(advariants, metadata['time'])[0]
+                if self._ci_average is not None:
+                    average = self._ci_average
+                    if self._is_torch(data):
+                        average = self._to_torch(average, like=data)
+                        data = torch.cat([average @ data[:n], average @ data[n:]])
+                    else:
+                        data = np.concatenate([average @ data[:n], average @ data[n:]])
+                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+                data = data[np.concatenate([mask, mask])]
 
         return self.cached_data[dtype], self.cached_noise['sigma'+dtype], data
 
-    def log_likelihood_image(self, parameters):
+    def _ci_averaging_matrix(self, n_advariants, avg_time, scan_avg):
+        """Build averaging weights in the same row order as coh_avg_ndarray.
+
+        The averaging plan is populated by the preceding coh_avg_ndarray call.
+        """
+        plan_key = (float(avg_time), bool(scan_avg), 0.0165, 0.0001)
+        plan = self._coh_avg_plan_cache[plan_key]
+        average_rows = []
+        output_times = []
+
+        for group in plan['group_plans']:
+            for j in range(group['n_bins']):
+                indices = group['ord_idx'][group['bin_inv'] == j]
+                weights = np.zeros(n_advariants)
+                weights[indices] = 1 / len(indices)
+                average_rows.append(weights)
+                output_times.append(self._ci_raw_metadata['time'][indices].mean())
+
+        # coh_avg_ndarray concatenates groups, then sorts by mean time.
+        order = np.argsort(output_times)
+        return np.asarray(average_rows)[order]
+
+    def _cache_ci_covariance(self, cov, data):
+        """Augment and stabilise CI covariance, then cache its inverse and logdet."""
+        extra_variance = (self.noise_frac * np.abs(data))**2 + self.static_noise_floor**2
+        diagonal = np.diag_indices_from(cov)
+        cov[diagonal] += extra_variance
+        cov *= self.noise_factor**2
+
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        if eigenvalues[-1] <= 0:
+            raise ValueError("CI covariance has no positive variance.")
+
+        # Normalisation can leave directions with very small variance.
+        eigenvalues = np.maximum(eigenvalues, 1e-10 * eigenvalues[-1])
+        self.cached_noise['covci'] = (eigenvectors * eigenvalues) @ eigenvectors.T
+        self.cached_noise['invcovci'] = (eigenvectors / eigenvalues) @ eigenvectors.T
+        self.cached_noise['logcovdetci'] = np.log(eigenvalues).sum()
+
+    def log_likelihood_image(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for image data.
 
         Parameters
@@ -468,13 +654,17 @@ class ModelLikelihood(bilby.Likelihood):
         logL = -0.5 * np.sum(np.abs((residual / sigma) ** 2) + np.log(2 * np.pi * sigma ** 2))
         return logL
 
-    def log_likelihood_vis(self, parameters):
+    def log_likelihood_vis(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for visibility data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for visibility data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for visibility data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -482,15 +672,21 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for visibility data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='vis', ttype='analytical')
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
-    def log_likelihood_visamp(self, parameters):
+    def log_likelihood_visamp(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for visibility amplitude data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for visibility amplitude data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for visibility amplitude data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -498,15 +694,21 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for visibility amplitude data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='visamp', ttype='analytical')
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
-    def log_likelihood_bispec(self, parameters):
+    def log_likelihood_bispec(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for bispectrum data.
         
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for bispectrum data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for bispectrum data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -514,15 +716,21 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for bispectrum data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='bispec', ttype='analytical')
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
-    def log_likelihood_cphase(self, parameters):
+    def log_likelihood_cphase(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for closure phase data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for closure phase data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for closure phase data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -534,17 +742,25 @@ class ModelLikelihood(bilby.Likelihood):
             data_t = self._to_torch(data, like=model_data)
             sigma_t = self._to_torch(sigma, like=model_data)
             residual = 1 - torch.cos(data_t - model_data)
+            if logcovdet is not None and invcov is not None:
+                return self._covariance_loglike(data_t, model_data, logcovdet, invcov)
             return -0.5 * torch.sum(residual / sigma_t ** 2 + torch.log(2 * torch.pi * sigma_t ** 2))
         residual = 1 - np.cos(data - model_data)
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return -0.5 * np.sum(residual / sigma ** 2 + np.log(2 * np.pi * sigma ** 2))
 
-    def log_likelihood_camp(self, parameters):
+    def log_likelihood_camp(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for closure amplitude data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for closure amplitude data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for closure amplitude data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -552,15 +768,21 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for closure amplitude data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='camp', ttype='analytical')
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
-    def log_likelihood_logcamp(self, parameters):
+    def log_likelihood_logcamp(self, parameters, logcovdet=None, invcov=None):
         """Calculate the log-likelihood for log closure amplitude data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for log closure amplitude data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for log closure amplitude data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -568,15 +790,21 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for log closure amplitude data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='logcamp', ttype='analytical')
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
-    def log_likelihood_ci(self, parameters): 
+    def log_likelihood_ci(self, parameters, logcovdet=None, invcov=None): 
         """Calculate the log-likelihood for closure invariant data.
 
         Parameters
         ----------
         parameters : dict
             The model parameters.
+        logcovdet : np.ndarray, optional
+            The log-determinant of the covariance matrix for closure invariant data. If provided, it will be used in the likelihood calculation.
+        invcov : np.ndarray, optional
+            The inverse of the covariance matrix for closure invariant data. If provided, it will be used in the likelihood calculation.
 
         Returns
         -------
@@ -584,6 +812,15 @@ class ModelLikelihood(bilby.Likelihood):
             The log-likelihood for closure invariant data.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype='ci', ttype='analytical')
+        if self.ci_cov:
+            if invcov is None:
+                invcov = self.cached_noise.get('invcovci')
+            if logcovdet is None:
+                logcovdet = self.cached_noise.get('logcovdetci')
+        else:
+            invcov = logcovdet = None
+        if logcovdet is not None and invcov is not None:
+            return self._covariance_loglike(data, model_data, logcovdet, invcov)
         return self._gaussian_loglike(data, model_data, sigma)
 
     def augment_sigma(self, data, sigma):
@@ -652,7 +889,8 @@ class ModelLikelihood(bilby.Likelihood):
         advariants : np.ndarray
             The calculated advariants.
         advariants_noise : np.ndarray
-            The propagated advariant uncertainties.
+            Component standard deviations packed as sigma_real + 1j * sigma_imag.
+            They are equal under the circular visibility-noise approximation.
         adv_metadata : np.ndarray
             Structured metadata for each advariant sample.
         """
@@ -672,9 +910,9 @@ class ModelLikelihood(bilby.Likelihood):
             ('u3', '<f8'),
             ('v3', '<f8'),
             ('adv', '<c16'),
-            ('sigma', '<f8'),
+            ('sigma', '<c16'),
             ('ci', '<c16'),
-            ('sigma_ci', '<f8'),
+            ('sigma_ci', '<c16'),
         ])
         adv_metadata_rows = []
         triad_time_dict = {}
@@ -682,6 +920,7 @@ class ModelLikelihood(bilby.Likelihood):
         v1s, v2s, v3s = [], [], []
         s1s, s2s, s3s = [], [], []
         metadata_entries = []
+        baseline_keys = [[], [], []]
 
         for tdata in tlist:
             tdata = tdata.astype(self.obs.data.dtype)
@@ -715,6 +954,10 @@ class ModelLikelihood(bilby.Likelihood):
                         continue
                     triad_time_dict[tri].append(triad_time)
 
+                for keys, baseline in zip(baseline_keys, (l1, l2, l3)):
+                    station1, station2 = str(baseline['t1']), str(baseline['t2'])
+                    keys.append(((float(baseline['time']), *sorted((station1, station2))),
+                                 station1 > station2))
                 v1s.append(l1['vis'])
                 v2s.append(l2['vis'])
                 v3s.append(l3['vis'])
@@ -736,26 +979,41 @@ class ModelLikelihood(bilby.Likelihood):
 
         if len(v1s) == 0:
             advariants = np.empty((N, 0), dtype=np.complex128)
-            advariants_noise = np.empty((N, 0), dtype=np.float64)
+            advariants_noise = np.empty((N, 0), dtype=np.complex128)
             adv_metadata = np.array(adv_metadata_rows, dtype=adv_metadata_dtype)
-            return np.squeeze(advariants), np.squeeze(advariants_noise)/np.sqrt(2), adv_metadata
+            return np.squeeze(advariants), np.squeeze(advariants_noise), adv_metadata
 
         v1, v2, v3 = [np.asarray(x, dtype=np.complex128) for x in (v1s, v2s, v3s)]
         s1, s2, s3 = [np.asarray(x, dtype=np.float64) for x in (s1s, s2s, s3s)]
 
         if add_noise:
-            noise_v1, noise_v2, noise_v3 = [np.random.normal(0, s, size=(N, len(v))) + 1j * np.random.normal(0, s, size=(N, len(v))) for s, v in zip((s1, s2, s3), (v1, v2, v3))]
+            draws = {}
+            noise = []
+            for keys, sigmas in zip(baseline_keys, (s1, s2, s3)):
+                columns = []
+                for (key, conjugated), sigma in zip(keys, sigmas):
+                    if key not in draws:
+                        draws[key] = sigma * (np.random.normal(size=N) + 1j * np.random.normal(size=N))
+                    columns.append(draws[key].conj() if conjugated else draws[key])
+                noise.append(np.column_stack(columns))
+            noise_v1, noise_v2, noise_v3 = noise
             v1, v2, v3 = v1[None, :] + noise_v1, v2[None, :] + noise_v2, v3[None, :] + noise_v3
 
         adv = v1 * np.conj(v2)**(-1) * v3
-        adv_noise = np.sqrt((s1[None, :] / np.abs(v1))**2 + (s2[None, :] / np.abs(v2))**2 + (s3[None, :] / np.abs(v3))**2) * np.abs(adv)
+        relative_variance = ((s1[None, :] / np.abs(v1))**2
+                             + (s2[None, :] / np.abs(v2))**2
+                             + (s3[None, :] / np.abs(v3))**2)
+        adv_noise = np.sqrt(relative_variance) * np.abs(adv)
 
         advariants = np.asarray(adv, dtype=np.complex128)
-        advariants_noise = np.asarray(adv_noise, dtype=np.float64)
+        # Circular visibility noise remains circular under the first-order
+        # (conjugate-)complex derivatives of v1 * v3 / conj(v2).
+        # Each input sigma is a per-real-component standard deviation, as in MC.
+        advariants_noise = np.asarray(adv_noise * (1 + 1j), dtype=np.complex128)
         adv0 = advariants[0] if advariants.ndim > 1 else advariants
         adv_noise0 = advariants_noise[0] if advariants_noise.ndim > 1 else advariants_noise
-        advariants = np.squeeze(np.asarray(advariants).reshape(N, -1))
-        advariants_noise = np.squeeze(np.asarray(advariants_noise).reshape(N, -1)) / np.sqrt(2)
+        advariants = np.squeeze(advariants.reshape(N, -1))
+        advariants_noise = np.squeeze(advariants_noise.reshape(N, -1))
 
         adv_metadata_rows = [
             (*entry, adv0[idx], adv_noise0[idx], np.nan, np.nan)
@@ -768,8 +1026,9 @@ class ModelLikelihood(bilby.Likelihood):
     def advariants_to_ci(self, advariants, times, advariants_noise=None):
         """Normalise advariants to closure invariants using uncertainty propagation.
         
-        Uses the uncertainties package for automatic error propagation if available,
-        otherwise falls back to analytical error propagation. Assumes independent Gaussian noise on the advariants.
+        Uses analytical first-order propagation, assuming independent Gaussian
+        real and imaginary advariant components. Cross-advariant correlations
+        are ignored.
 
         Parameters
         ----------
@@ -779,7 +1038,9 @@ class ModelLikelihood(bilby.Likelihood):
         times : np.ndarray
             The times corresponding to the advariants. Must be 1D with length M.
         advariants_noise : np.ndarray, optional
-            The noise associated with the advariants. Must match the shape of advariants.
+            Component standard deviations packed as sigma_real + 1j * sigma_imag.
+            Real inputs apply the same sigma to both components.
+            Must match the shape of advariants.
 
         Returns
         -------
@@ -807,67 +1068,101 @@ class ModelLikelihood(bilby.Likelihood):
             if advariants_noise.shape != advariants.shape:
                 raise ValueError("advariants_noise must match the shape of advariants")
 
-        time_axis = np.concatenate([times, times], axis=0)
-        real_valued_advariants = np.concatenate([advariants.real, advariants.imag], axis=1)
+        groups, order, starts = self._ci_time_groups(times)
+        values = np.concatenate([advariants.real, advariants.imag], axis=1)
+        if times.size == 0:
+            ci = values[0] if squeeze_output else values
+            return ci, np.empty_like(ci) if advariants_noise is not None else None
+        sum_norm_p = np.add.reduceat(np.abs(values[:, order])**self.normpower, starts, axis=1)
+        norm = sum_norm_p[:, groups]**(1 / self.normpower)
+        ci = values / norm
 
+        sigma_ci = None
         if advariants_noise is not None:
-            real_valued_advariants_noise = np.concatenate([advariants_noise, advariants_noise], axis=1)
-
-        unique_times = np.unique(times)
-        norm_per_time = np.empty((advariants.shape[0], len(unique_times)), dtype=float)
-        norm_noise_per_time = np.empty((advariants.shape[0], len(unique_times)), dtype=float) if advariants_noise is not None else None
-
-        for j, t in enumerate(unique_times):
-            mask = (time_axis == t)
-            values = real_valued_advariants[:, mask]
-            sum_norm_p = np.sum(np.abs(values)**self.normpower, axis=1)
-            norm_per_time[:, j] = sum_norm_p**(1/self.normpower)
-
-            if advariants_noise is not None:
-                sigmas = real_valued_advariants_noise[:, mask]
-                dnorm_dx = (np.abs(values)**(self.normpower - 1) * np.sign(values) /
-                            sum_norm_p[:, None]**(1 - 1/self.normpower))
-                norm_noise_per_time[:, j] = np.sqrt(np.sum((dnorm_dx * sigmas)**2, axis=1))
-
-        norm_map = np.empty_like(real_valued_advariants)
-        for j, t in enumerate(unique_times):
-            mask = (time_axis == t)
-            norm_map[:, mask] = norm_per_time[:, j:j+1]
-
-        real_valued_advariants_norm = real_valued_advariants / norm_map
-
-        if advariants_noise is not None:
-            real_valued_advariants_noise_norm = np.empty_like(real_valued_advariants_noise)
-            for j, t in enumerate(unique_times):
-                mask = (time_axis == t)
-                value_unnormalized = real_valued_advariants[:, mask]
-                sigma_x = real_valued_advariants_noise[:, mask]
-                sigma_norm = norm_noise_per_time[:, j:j+1]
-                norm = norm_per_time[:, j:j+1]
-                variance = (sigma_x / norm)**2 + (value_unnormalized * sigma_norm / norm**2)**2
-                real_valued_advariants_noise_norm[:, mask] = np.sqrt(variance)
-            if squeeze_output:
-                return real_valued_advariants_norm[0], real_valued_advariants_noise_norm[0]
-            return real_valued_advariants_norm, real_valued_advariants_noise_norm
+            # Legacy real inputs apply the same sigma to both components.
+            sigma_real = advariants_noise.real
+            sigma_imag = advariants_noise.imag if np.iscomplexobj(advariants_noise) else sigma_real
+            sigma = np.concatenate([sigma_real, sigma_imag], axis=1)
+            dnorm_dx = np.abs(values)**(self.normpower - 1) * np.sign(values) / norm**(self.normpower - 1)
+            norm_variance = np.add.reduceat((dnorm_dx * sigma)[:, order]**2, starts, axis=1)
+            variance = ((sigma / norm)**2 + values**2 * norm_variance[:, groups] / norm**4
+                        - 2 * values * sigma**2 * dnorm_dx / norm**3)
+            sigma_ci = np.sqrt(np.maximum(variance, 0))
 
         if squeeze_output:
-            return real_valued_advariants_norm[0], None
-        return real_valued_advariants_norm, None
-    
-    
-    def estimate_noise_ci(self, N=1000): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
+            return ci[0], sigma_ci[0] if sigma_ci is not None else None
+        return ci, sigma_ci
+
+    def _ci_time_groups(self, times):
+        """Cache the grouping used by real and imaginary CI components."""
+        cached = getattr(self, '_ci_group_cache', None)
+        if cached is None or not np.array_equal(cached[0], times):
+            _, groups = np.unique(times, return_inverse=True)
+            groups = np.concatenate([groups, groups])
+            order = np.argsort(groups, kind='stable')
+            starts = np.flatnonzero(np.r_[True, np.diff(groups[order]) != 0])
+            cached = (times.copy(), groups, order, starts)
+            self._ci_group_cache = cached
+        return cached[1:]
+
+    def estimate_noise_ci(self, N=5000, calc_cov=True): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
         """Estimate the noise for closure invariant data.
 
         Returns
         -------
         sigma_ci : np.ndarray
             The estimated noise for closure invariant data.
+        covariance_ci : np.ndarray
+            The estimated covariance matrix for closure invariant data.
         """
 
         advariants_noisy, _, adv_metadata = self.calc_advariants(N=N, add_noise=True, count=self.count)
         ci_noisy_samples, _ = self.advariants_to_ci(advariants_noisy, adv_metadata['time'])
-        sigma_ci = np.std(ci_noisy_samples, axis=0)
-        return sigma_ci
+        if calc_cov:
+            covariance_ci = np.cov(ci_noisy_samples, rowvar=False)
+            sigma_ci = np.sqrt(np.diag(covariance_ci))
+            return sigma_ci, covariance_ci
+        else:
+            sigma_ci = np.std(ci_noisy_samples, axis=0, ddof=1)
+            return sigma_ci, None
+
+    def calc_uvdist(self, uv_arr):
+        """Calculate the UV distance for a given array of UV coordinates.
+
+        Parameters
+        ----------
+        uv_arr : np.ndarray
+            The array of UV coordinates with shape (N, 2), where N is the number of baselines.
+
+        Returns
+        -------
+        uvdist : np.ndarray
+            The UV distance for each baseline.
+        """
+        if uv_arr.ndim == 2:
+            uvdist = np.sqrt(uv_arr[0]**2 + uv_arr[1]**2)
+        else:
+            uvdist = np.array([np.sqrt(uv_arr[j][0]**2 + uv_arr[j][1]**2) for j in range(len(uv_arr))])
+            uvdist = np.sum(uvdist, axis=0)
+        return uvdist
+    
+    def filter_by_uvdist_ranges(self, uv, uv_ranges):
+        if uv_ranges is None:
+            return np.ones(np.asarray(uv).shape[-1], dtype=bool)
+        uv = np.asarray(uv)
+        ranges = tuple(tuple(bounds) for bounds in uv_ranges)
+        if not hasattr(self, '_uv_mask_cache'):
+            self._uv_mask_cache = {}
+        key = (uv.shape, uv.dtype.str, ranges)
+        cached = self._uv_mask_cache.get(key)
+        if cached is None or not np.array_equal(cached[0], uv):
+            uvdists = self.calc_uvdist(uv)
+            mask = np.zeros_like(uvdists, dtype=bool)
+            for uv_min, uv_max in ranges:
+                mask |= (uvdists >= uv_min) & (uvdists <= uv_max)
+            cached = (uv.copy(), mask)
+            self._uv_mask_cache[key] = cached
+        return cached[1].copy()
 
     def plot_all(self, parameters=None, save_path=None, avg_time=None, scan_avg=None, fig=None, axs=None, color='b'):
         """Plot the data and model for all data types.
@@ -891,10 +1186,14 @@ class ModelLikelihood(bilby.Likelihood):
         """
         import matplotlib.pyplot as plt
 
+        self.clear_cached_data()
+
         if avg_time is None:
             avg_time = self.avg_time
         if scan_avg is None:
             scan_avg = self.scan_avg
+        cached_uvdist_sections = self.uvdist_sections
+        self.uvdist_sections = None
 
         if fig is None or axs is None or axs.shape != (2, 4):
             fig, axs = plt.subplots(2, 4, figsize=(16,12))
@@ -910,12 +1209,8 @@ class ModelLikelihood(bilby.Likelihood):
             # 'log Closure Invariants Real': lambda x: np.log(np.real(x)), 'log Closure Invariants Imag': lambda x: np.log(np.imag(x))}
 
         for i, (title, dtype) in enumerate(dterms.items()):
-            data, sigma, model_data = self.sample_data(parameters, dtype=dtype, ttype='analytical', avg_time=avg_time, scan_avg=scan_avg)
-            if dtype in ['visamp', 'vis']:
-                uvdist = np.sqrt(self.uv[dtype][0]**2 + self.uv[dtype][1]**2)
-            else:
-                uvdist = [np.sqrt(self.uv[dtype][j][0]**2 + self.uv[dtype][j][1]**2) for j in range(len(self.uv[dtype]))]
-                uvdist = np.sum(uvdist, axis=0)
+            data, sigma, model_data = self.sample_data(parameters, dtype=dtype, ttype='analytical', avg_time=avg_time, scan_avg=scan_avg, uvdist_sections=None)
+            uvdist = self.calc_uvdist(self.uv[dtype])
 
             if title == 'Visibility Phase':
                 sigma = np.real(sigma/np.abs(data))  # phase error approximation
@@ -927,7 +1222,7 @@ class ModelLikelihood(bilby.Likelihood):
                 sigma = sigma[:len(sigma)//2]
                 if title == 'Closure Invariants Phase':
                     sigma = np.real(sigma/np.abs(data))  # phase error approximation
-                
+
             axs[i%2, i//2].errorbar(uvdist, ops[title](data), yerr=sigma, fmt='o', color=color, markersize=0, capsize=1, alpha=errorbar_alpha, label='Data')
             if parameters is not None:
                 axs[i%2, i//2].scatter(uvdist, ops[title](model_data), color='red', s=5, label='Model')
@@ -942,6 +1237,9 @@ class ModelLikelihood(bilby.Likelihood):
 
         if save_path is not None:
             plt.savefig(save_path, dpi=200)
+
+        self.clear_cached_data()
+        self.uvdist_sections = cached_uvdist_sections
 
         return fig, axs
         
@@ -1000,11 +1298,11 @@ class ModelLikelihood(bilby.Likelihood):
         """
         if invert:
             ci = np.concatenate([ci.real, ci.imag])
-            ci_err = np.concatenate([ci_err, ci_err])
+            ci_err = np.concatenate([ci_err.real, ci_err.imag])
             return ci, ci_err
         else:
             complex_ci = ci[:len(ci)//2] + 1j*ci[len(ci)//2:]
-            ci_err = ci_err[:len(ci_err)//2]
+            ci_err = ci_err[:len(ci_err)//2] + 1j * ci_err[len(ci_err)//2:]
             return complex_ci, ci_err
 
     def add_scans(self, time_array, dt=0.0165, margin=0.0001):

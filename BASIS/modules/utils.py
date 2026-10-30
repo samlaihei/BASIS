@@ -1,3 +1,6 @@
+from functools import lru_cache
+
+import numpy as np
 import torch
 
 def _any_tensor(*args):
@@ -11,3 +14,14 @@ def _as_tensors(*args, dtype=None, device=None):
         else:
             tensors.append(torch.tensor(arg, dtype=dtype, device=device))
     return tensors
+
+@lru_cache(maxsize=32)
+def _image_axis(dim, fov):
+    """Cache the fixed image axis used when constructing model components."""
+    return np.linspace(-fov / 2, fov / 2, dim)
+
+
+def image_axes(dim, fov):
+    """Return independent coordinate arrays without rebuilding the grid spacing."""
+    axis = _image_axis(dim, fov)
+    return axis.copy(), axis.copy()

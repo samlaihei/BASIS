@@ -124,8 +124,7 @@ class pixelgrid(object):
         if self.grid_n * self.grid_n != len(self.pixel_values):
             raise ValueError("Number of pixel parameters must be a perfect square.")
 
-        self.X = np.linspace(-self.fov/2, self.fov/2,self.dim)
-        self.Y = np.linspace(-self.fov/2, self.fov/2,self.dim)
+        self.X, self.Y = utils.image_axes(self.dim, self.fov)
         self.psize = (self.X[1]-self.X[0])
     
     def sky_map(self):

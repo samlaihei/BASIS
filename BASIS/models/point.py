@@ -44,8 +44,7 @@ class point(object):
         self.fov = fov
         self.gauss_blur_sigma = gauss_blur_sigma
 
-        self.X = np.linspace(-self.fov/2, self.fov/2,self.dim)
-        self.Y = np.linspace(-self.fov/2, self.fov/2,self.dim)
+        self.X, self.Y = utils.image_axes(self.dim, self.fov)
         self.psize = (self.X[1]-self.X[0])
     
     def sky_map(self):
