@@ -1,4 +1,5 @@
 from BASIS.models import base
+from BASIS.modules.utils import silence_output
 
 import bilby
 import numpy as np
@@ -54,15 +55,13 @@ class ModelLikelihood(bilby.Likelihood):
         self.uvdist_sections = uvdist_sections
 
         if obs_addAll:
-            try:
-                obs.add_all(count=self.count)
-                print("All data terms added successfully.")
-            except Exception as e:
-                print(f"Error adding all data terms: {e}. Adding required data terms.")
-                obs.add_bispec(count=self.count)
-                obs.add_cphase(count=self.count)
-                obs.add_camp(count=self.count)
-                print("Required data terms added successfully.")
+            with silence_output():
+                try:
+                    obs.add_all(count=self.count)
+                except Exception:
+                    obs.add_bispec(count=self.count)
+                    obs.add_cphase(count=self.count)
+                    obs.add_camp(count=self.count)
 
         self.cached_data = {}
         self.cached_noise = {}
@@ -159,7 +158,8 @@ class ModelLikelihood(bilby.Likelihood):
         self.obs.data['sigma'] = new_sigma
 
         if obs_addAll:
-            self.obs.add_all(count=self.count)
+            with silence_output():
+                self.obs.add_all(count=self.count)
 
         self.clear_cached_data()
 

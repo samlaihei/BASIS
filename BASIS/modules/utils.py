@@ -1,4 +1,6 @@
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from functools import lru_cache
+import os
 
 import numpy as np
 import torch
@@ -25,3 +27,11 @@ def image_axes(dim, fov):
     """Return independent coordinate arrays without rebuilding the grid spacing."""
     axis = _image_axis(dim, fov)
     return axis.copy(), axis.copy()
+
+
+@contextmanager
+def silence_output():
+    """Temporarily silence stdout and stderr, restoring them even after errors."""
+    with open(os.devnull, 'w') as stream:
+        with redirect_stdout(stream), redirect_stderr(stream):
+            yield
