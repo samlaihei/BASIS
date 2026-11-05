@@ -1,5 +1,5 @@
-from BASIS.models import base
-from BASIS.modules.utils import silence_output
+from GCFit.models import base
+from GCFit.modules import utils
 
 import bilby
 import numpy as np
@@ -7,9 +7,9 @@ import torch
 import itertools as it
 
 class ModelLikelihood(bilby.Likelihood):
-    def __init__(self, obs, model_names=None, img=None, imgdim=128, fov=225, count='min',  dterms={'vis':100},
+    def __init__(self, obs, model_names=None, imgdim=128, fov=225, count='min',  dterms={'vis':100},
                  static_noise_floor=0, noise_frac=0, noise_factor=1, avg_time=0, scan_avg=False, uvdist_sections=None,
-                 obs_addAll=True, ci_cov=False):
+                 use_cov=False, cov_samples=1000):
         """Initialize the ModelLikelihood class.
 
         Parameters
@@ -18,8 +18,6 @@ class ModelLikelihood(bilby.Likelihood):
             The observational data.
         model_names : list of str, optional
             The names of the models to use (default is None).
-        img : eht.image.Image, optional
-            The image data to use for the likelihood (default is None).
         imgdim : int, optional
             The image dimension (default is 128).
         fov : float, optional
@@ -32,12 +30,15 @@ class ModelLikelihood(bilby.Likelihood):
             The fraction of additional noise to be added (default is 0).
         noise_factor : float, optional
             The factor to scale the noise (default is 1).
-        obs_addAll : bool, optional
-            Whether to add all data terms to the obs data table (default is True).
         dterms : dict, optional
             The data terms to include in the likelihood and their weighting (default is visibility data).
-        ci_cov : bool, optional
-            Whether to compute and use the covariance for closure invariants (default is False).
+        use_cov : bool, optional
+            Use covariance likelihoods for each data term (default is False).
+            Visibilities use analytical diagonal covariance; other terms use MC.
+            Covariances are separate per term, without cross-term correlations.
+        cov_samples : int, optional
+            Minimum MC draws (default 1000); at least five per real feature are
+            used. Covariance is cached after averaging, filtering and augmentation.
         """
 
         super().__init__()
@@ -49,26 +50,19 @@ class ModelLikelihood(bilby.Likelihood):
         self.static_noise_floor = static_noise_floor
         self.noise_frac = noise_frac
         self.noise_factor = noise_factor
-        self.img = img
         self.avg_time = avg_time
         self.scan_avg = scan_avg
         self.uvdist_sections = uvdist_sections
-
-        if obs_addAll:
-            with silence_output():
-                try:
-                    obs.add_all(count=self.count)
-                except Exception:
-                    obs.add_bispec(count=self.count)
-                    obs.add_cphase(count=self.count)
-                    obs.add_camp(count=self.count)
 
         self.cached_data = {}
         self.cached_noise = {}
         self.uv = {}
 
         self.dterms = dterms
-        self.ci_cov = ci_cov
+        self.use_cov = use_cov
+        if not isinstance(cov_samples, (int, np.integer)) or cov_samples < 2:
+            raise ValueError("cov_samples must be an integer >= 2")
+        self.cov_samples = cov_samples
 
         # Closure invariants
         self.normpower = 2
@@ -78,63 +72,31 @@ class ModelLikelihood(bilby.Likelihood):
             self.params = self.model.params
 
     @staticmethod
-    def _is_torch(x):
-        return torch.is_tensor(x)
-
-    @staticmethod
-    def _to_torch(x, like=None, complex_ok=False):
-        if torch.is_tensor(x):
-            return x
-        if like is not None and torch.is_tensor(like):
-            if complex_ok:
-                dtype = like.dtype
-            else:
-                dtype = like.real.dtype if like.is_complex() else like.dtype
-            return torch.as_tensor(x, dtype=dtype, device=like.device)
-        return torch.as_tensor(x)
-
-    @staticmethod
-    def _to_numpy(x):
-        if torch.is_tensor(x):
-            return x.detach().cpu().numpy()
-        return np.asarray(x)
-
-    @staticmethod
-    def _compute_cov(data):
-        # Given data in shape (n_samples, n_features), compute the covariance matrix.
-        data = np.asarray(data)
-        if data.ndim != 2:
-            raise ValueError("Expected data to be a 2D array with shape (n_samples, n_features).")
-        return np.cov(data, rowvar=False)
-
-    @staticmethod
-    def _compute_logcovdet(cov):
-        cov = np.asarray(cov)
-        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
-            raise ValueError("Expected cov to be a 2D square matrix.")
-        sign, logdet = np.linalg.slogdet(cov)
-        if sign <= 0:
-            raise ValueError("Covariance matrix must be positive definite.")
-        return logdet
-
-    @staticmethod
-    def _compute_invcov(cov):
-        cov = np.asarray(cov)
-        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
-            raise ValueError("Expected cov to be a 2D square matrix.")
-        return np.linalg.inv(cov)
+    def _reorder_obsdata_ndarray(obsdata):
+        temp_obsdata = obsdata.data.copy()
+        base_cols = [name for name in temp_obsdata.dtype.names if not any(k in name for k in ['vis', 'sigma'])]
+        interleaved_cols = []
+        for q in ['', 'q', 'u', 'v']:
+            interleaved_cols.extend(name for name in (f'{q}vis', f'{q}sigma')
+                                    if name in temp_obsdata.dtype.names)
+        new_order = base_cols + interleaved_cols
+        new_dtype = np.dtype([(name, temp_obsdata.dtype[name]) for name in new_order])
+        reordered_data = np.empty(temp_obsdata.shape, dtype=new_dtype)
+        for name in new_order:
+            reordered_data[name] = temp_obsdata[name]
+        return reordered_data
 
     def clear_cached_data(self):
         self.cached_data = {}
         self.cached_noise = {}
         self.uv = {}
         for name in ('_coh_avg_plan_cache', '_ci_group_cache', '_uv_plan_cache',
-                     '_gaussian_norm_cache', '_uv_mask_cache'):
+                     '_gaussian_norm_cache', '_uv_mask_cache', '_camp_metadata'):
             if hasattr(self, name):
                 delattr(self, name)
         return
 
-    def replace_obs_vis(self, new_vis, new_sigma, obs_addAll=False):
+    def replace_obs_vis(self, new_vis, new_sigma):
         """
         Replace only the observed visibilities and their associated uncertainties in the observation data.
 
@@ -144,8 +106,6 @@ class ModelLikelihood(bilby.Likelihood):
             The new observed visibilities to replace in the observation data.
         new_sigma : array-like
             The new uncertainties associated with the observed visibilities.
-        obs_addAll : bool, optional
-            Whether to add all data terms to the observation after replacing the visibilities. Default is False.
         """
 
         # Check shape matches obs.data['vis']
@@ -156,10 +116,6 @@ class ModelLikelihood(bilby.Likelihood):
 
         self.obs.data['vis'] = new_vis
         self.obs.data['sigma'] = new_sigma
-
-        if obs_addAll:
-            with silence_output():
-                self.obs.add_all(count=self.count)
 
         self.clear_cached_data()
 
@@ -187,7 +143,7 @@ class ModelLikelihood(bilby.Likelihood):
             self._uv_plan_cache[key] = plan
 
         vis_unique = model.sample_vis(plan[1], ttype=ttype)
-        if self._is_torch(vis_unique):
+        if utils.is_torch(vis_unique):
             inverse = torch.as_tensor(plan[2], device=vis_unique.device)
             vis_stacked = vis_unique[inverse]
         else:
@@ -195,12 +151,12 @@ class ModelLikelihood(bilby.Likelihood):
         return [vis_stacked[i * n_points:(i + 1) * n_points] for i in range(n_baselines)]
 
     def _gaussian_loglike(self, data, model_data, sigma):
-        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
-            like = model_data if self._is_torch(model_data) else data
-            data_t = self._to_torch(data, like=like, complex_ok=True)
-            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+        if utils.is_torch(data) or utils.is_torch(model_data) or utils.is_torch(sigma):
+            like = model_data if utils.is_torch(model_data) else data
+            data_t = utils.to_torch(data, like=like, complex_ok=True)
+            model_t = utils.to_torch(model_data, like=data_t, complex_ok=True)
             residual_t = data_t - model_t
-            sigma_t = self._to_torch(sigma, like=residual_t, complex_ok=False)
+            sigma_t = utils.to_torch(sigma, like=residual_t, complex_ok=False)
             return -0.5 * torch.sum(torch.abs(residual_t / sigma_t) ** 2 + torch.log(2 * torch.pi * sigma_t ** 2))
         sigma = np.asarray(sigma)
         if not hasattr(self, '_gaussian_norm_cache'):
@@ -214,13 +170,13 @@ class ModelLikelihood(bilby.Likelihood):
         return -0.5 * np.sum(np.abs((residual / sigma)**2) + cached[1])
 
     def _covariance_loglike(self, data, model_data, logcovdet, invcov):
-        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(logcovdet) or self._is_torch(invcov):
-            like = model_data if self._is_torch(model_data) else data
-            data_t = self._to_torch(data, like=like, complex_ok=True)
-            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+        if utils.is_torch(data) or utils.is_torch(model_data) or utils.is_torch(logcovdet) or utils.is_torch(invcov):
+            like = model_data if utils.is_torch(model_data) else data
+            data_t = utils.to_torch(data, like=like, complex_ok=True)
+            model_t = utils.to_torch(model_data, like=data_t, complex_ok=True)
             residual_t = data_t - model_t
-            logcovdet_t = self._to_torch(logcovdet, like=residual_t, complex_ok=False)
-            invcov_t = self._to_torch(invcov, like=residual_t, complex_ok=False)
+            logcovdet_t = utils.to_torch(logcovdet, like=residual_t, complex_ok=False)
+            invcov_t = utils.to_torch(invcov, like=residual_t, complex_ok=False)
             x_t = torch.matmul(invcov_t, residual_t)
             chi2_t = torch.sum(residual_t.conj() * x_t).real
             return -0.5 * (chi2_t + logcovdet_t + data_t.numel() * np.log(2 * np.pi))
@@ -230,23 +186,23 @@ class ModelLikelihood(bilby.Likelihood):
         return -0.5 * (chi2 + logcovdet + np.size(data) * np.log(2 * np.pi))
 
     def _gaussian_redchi2(self, data, model_data, sigma):
-        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(sigma):
-            like = model_data if self._is_torch(model_data) else data
-            data_t = self._to_torch(data, like=like, complex_ok=True)
-            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+        if utils.is_torch(data) or utils.is_torch(model_data) or utils.is_torch(sigma):
+            like = model_data if utils.is_torch(model_data) else data
+            data_t = utils.to_torch(data, like=like, complex_ok=True)
+            model_t = utils.to_torch(model_data, like=data_t, complex_ok=True)
             residual_t = data_t - model_t
-            sigma_t = self._to_torch(sigma, like=residual_t, complex_ok=False)
+            sigma_t = utils.to_torch(sigma, like=residual_t, complex_ok=False)
             return torch.sum(torch.abs(residual_t / sigma_t) ** 2)/len(data_t)
         residual = data - model_data
         return np.sum(np.abs(residual / sigma) ** 2)/len(data)
 
     def _covariance_redchi2(self, data, model_data, invcov):
-        if self._is_torch(data) or self._is_torch(model_data) or self._is_torch(invcov):
-            like = model_data if self._is_torch(model_data) else data
-            data_t = self._to_torch(data, like=like, complex_ok=True)
-            model_t = self._to_torch(model_data, like=data_t, complex_ok=True)
+        if utils.is_torch(data) or utils.is_torch(model_data) or utils.is_torch(invcov):
+            like = model_data if utils.is_torch(model_data) else data
+            data_t = utils.to_torch(data, like=like, complex_ok=True)
+            model_t = utils.to_torch(model_data, like=data_t, complex_ok=True)
             residual_t = data_t - model_t
-            invcov_t = self._to_torch(invcov, like=residual_t, complex_ok=False)
+            invcov_t = utils.to_torch(invcov, like=residual_t, complex_ok=False)
             x_t = torch.matmul(invcov_t, residual_t)
             chi2_t = torch.sum(residual_t.conj() * x_t).real
             return chi2_t / len(data)
@@ -257,8 +213,8 @@ class ModelLikelihood(bilby.Likelihood):
 
     def advariants_to_ci_torch(self, advariants, times):
         """Normalise advariants to closure invariants with torch operations."""
-        advariants_t = self._to_torch(advariants, complex_ok=True)
-        times_t = self._to_torch(times, like=advariants_t.real)
+        advariants_t = utils.to_torch(advariants, complex_ok=True)
+        times_t = utils.to_torch(times, like=advariants_t.real)
 
         values = torch.cat([advariants_t.real, advariants_t.imag], dim=0)
         _, groups = torch.unique(times_t, return_inverse=True)
@@ -292,7 +248,7 @@ class ModelLikelihood(bilby.Likelihood):
         parameters : dict
             The model parameters.
         dtype : str, optional
-            The data type to use for the reduced chi-squared calculation ('image', 'vis', 'visamp', 'bispec', 'cphase', 'camp', 'logcamp', 'ci'). Default is 'vis'.
+            The data type to use for the reduced chi-squared calculation ('vis', 'visamp', 'bispec', 'cphase', 'camp', 'logcamp', 'ci'). Default is 'vis'.
 
         Returns
         -------
@@ -300,6 +256,17 @@ class ModelLikelihood(bilby.Likelihood):
             The reduced chi-squared.
         """
         data, sigma, model_data = self.sample_data(parameters, dtype=dtype)
+        if self.use_cov:
+            if dtype == 'cphase':
+                residual = (utils.to_torch(data, like=model_data) - model_data
+                            if utils.is_torch(model_data) else data - model_data)
+                if utils.is_torch(residual):
+                    residual = torch.atan2(torch.sin(residual), torch.cos(residual))
+                else:
+                    residual = np.angle(np.exp(1j * residual))
+                return self._covariance_redchi2(residual, residual * 0, self.cached_noise['invcov_'+dtype])
+            return self._covariance_redchi2(utils.real_features(data), utils.real_features(model_data),
+                                           self.cached_noise['invcov_'+dtype])
         return self._gaussian_redchi2(data, model_data, sigma)
 
     def log_likelihood(self, parameters):
@@ -316,8 +283,7 @@ class ModelLikelihood(bilby.Likelihood):
             The total log-likelihood.
         """
         lnlike = 0
-        dterm_func = {'image': self.log_likelihood_image,
-                      'vis': self.log_likelihood_vis,
+        dterm_func = {'vis': self.log_likelihood_vis,
                       'visamp': self.log_likelihood_visamp,
                       'bispec': self.log_likelihood_bispec,
                       'cphase': self.log_likelihood_cphase,
@@ -328,10 +294,8 @@ class ModelLikelihood(bilby.Likelihood):
         for dterm, weight in self.dterms.items():
             add_lnlike = 0
             loglike_func = dterm_func.get(dterm, None)
-            invcov = self.cached_noise.get('invcov'+dterm, None)
-            logcovdet = self.cached_noise.get('logcovdet'+dterm, None)
             if loglike_func is not None:
-                add_lnlike = loglike_func(parameters, invcov=invcov, logcovdet=logcovdet)
+                add_lnlike = loglike_func(parameters)
 
             add_lnlike *= weight/100
             lnlike += add_lnlike
@@ -346,11 +310,11 @@ class ModelLikelihood(bilby.Likelihood):
         parameters : dict
             The model parameters.
         dtype : str, optional
-            The data type to sample ('image', 'vis', 'visamp', 'bispec', 'cphase', 'camp', 'logcamp', 'ci'). Default is 'vis'.
+            The data type to sample ('vis', 'visamp', 'bispec', 'cphase', 'camp', 'logcamp', 'ci'). Default is 'vis'.
         ttype : str, optional
             The type of sampling ('analytical' or 'dft'). Default is 'analytical'.
         min_sep_time : float, optional
-            The minimum separation time in seconds between triangles to be considered (default is 0). Only works for ci data type.
+            The minimum separation time in seconds between repeated triangles or quadrangles (default is 0).
         avg_time : float, optional
             The averaging time in seconds for the data. Default is 0 (no averaging).
         scan_avg : bool, optional
@@ -383,156 +347,89 @@ class ModelLikelihood(bilby.Likelihood):
             self.clear_cached_data()
         if uvdist_sections is None:
             uvdist_sections = self.uvdist_sections
-        
-        data = None
-    
-        if dtype == 'image' and self.img is not None:
-            if dtype not in self.cached_data:
-                self.cached_data[dtype] = self.img
-                self.cached_noise['sigma'+dtype] = np.ones_like(self.img._imdict['I'])*1e-4  # Assuming uniform noise for image
-            if parameters is not None:
-                data = model.sky_map()
-        
-        elif dtype == 'vis':
-            if dtype not in self.cached_data:
-                temp_obsdata = self.obs.data.copy()
-                base_cols = [name for name in temp_obsdata.dtype.names if not any(k in name for k in ['vis', 'sigma'])]
-                interleaved_cols = []
-                for q in ['', 'q', 'u', 'v']:
-                    interleaved_cols.extend([f'{q}vis', f'{q}sigma'])
-                new_order = base_cols + interleaved_cols
-                new_dtype = np.dtype([(name, temp_obsdata.dtype[name]) for name in new_order])
-                reordered_data = np.empty(temp_obsdata.shape, dtype=new_dtype)
-                for name in new_order:
-                    reordered_data[name] = temp_obsdata[name]
+        config = (self.count, float(min_sep_time), float(avg_time), bool(scan_avg),
+                  None if uvdist_sections is None else tuple(map(tuple, uvdist_sections)),
+                  bool(self.use_cov), self.cov_samples, self.noise_frac,
+                  self.static_noise_floor, self.noise_factor)
+        if getattr(self, '_sample_config', None) != config:
+            self.clear_cached_data()
+            self._sample_config = config
 
-                temp_obsdata = reordered_data
-                temp_obsdata = self.coh_avg_ndarray(temp_obsdata, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = temp_obsdata['vis']
-                self.cached_noise['sigma'+dtype] = temp_obsdata['sigma']
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([temp_obsdata['u'], temp_obsdata['v']])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+        data = None
+        
+        if dtype in ('vis', 'visamp'):
+            if dtype not in self.cached_data:
+                obsdata = self._reorder_obsdata_ndarray(self.obs)
+                obsdata = self.coh_avg_ndarray(obsdata, avg_time=avg_time, scan_avg=scan_avg)
+                values = obsdata['vis'] if dtype == 'vis' else np.abs(obsdata['vis'])
+                self._cache_observed_data(dtype, values, obsdata['sigma'], obsdata,
+                                          uvdist_sections)
 
             if parameters is not None:
                 data = model.sample_vis(self.uv[dtype], ttype=ttype)
+                if dtype == 'visamp':
+                    data = torch.abs(data) if utils.is_torch(data) else np.abs(data)
                 mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
                 data = data[mask]
-            
-        elif dtype == 'visamp':
-            if dtype not in self.cached_data:                
-                obsdata = self.coh_avg_ndarray(self.obs.amp, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = np.abs(obsdata['amp'])
-                self.cached_noise['sigma'+dtype] = obsdata['sigma']
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([obsdata['u'], obsdata['v']])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
 
-            if parameters is not None:
-                vis_data = model.sample_vis(self.uv[dtype], ttype=ttype)
-                data = torch.abs(vis_data) if self._is_torch(vis_data) else np.abs(vis_data)
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                data = data[mask]
-        
-        elif dtype == 'bispec':
+        elif dtype in ('bispec', 'cphase'):
             if dtype not in self.cached_data:
-                obsdata = self.coh_avg_ndarray(self.obs.bispec, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = obsdata['bispec']
-                self.cached_noise['sigma'+dtype] = obsdata['sigmab']
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
-                                [obsdata['u2'], obsdata['v2']],
-                                [obsdata['u3'], obsdata['v3']]])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
-            
+                metadata = self.calc_bispectrum(count=self.count, min_sep_time=min_sep_time)[2]
+                self.bispec = self.coh_avg_ndarray(metadata, avg_time=avg_time, scan_avg=scan_avg)
+                values, sigma = self.bispec['bispec'], self.bispec['sigma_bispec']
+                if dtype == 'cphase':
+                    amplitude = np.abs(values)
+                    sigma = np.divide(sigma, amplitude, out=np.full(len(values), np.inf),
+                                      where=amplitude > 0)
+                    values = np.angle(values)
+                self._cache_observed_data(dtype, values, sigma, self.bispec,
+                                          uvdist_sections, n_baselines=3)
+
             if parameters is not None:
                 vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
                 data = vis1 * vis2 * vis3
+                if dtype == 'cphase':
+                    data = torch.angle(data) if utils.is_torch(data) else np.angle(data)
                 mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
                 data = data[mask]
-        
-        elif dtype == 'cphase':
+
+        elif dtype in ('camp', 'logcamp'):
             if dtype not in self.cached_data:
-                obsdata = self.coh_avg_ndarray(self.obs.cphase, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = obsdata['cphase']*np.pi/180
-                self.cached_noise['sigma'+dtype] = obsdata['sigmacp']*np.pi/180
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
-                                [obsdata['u2'], obsdata['v2']],
-                                [obsdata['u3'], obsdata['v3']]])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
+                if not hasattr(self, '_camp_metadata'):
+                    self._camp_metadata = self.calc_camp(
+                        count=self.count, min_sep_time=min_sep_time)[2]
+                self.camp = self.coh_avg_ndarray(
+                    self._camp_metadata, avg_time=avg_time, scan_avg=scan_avg)
+                values, sigma = self.camp['camp'], self.camp['sigma_camp']
+                if dtype == 'logcamp':
+                    sigma = sigma / values
+                    values = np.log(values)
+                self._cache_observed_data(dtype, values, sigma, self.camp,
+                                          uvdist_sections, n_baselines=4)
 
             if parameters is not None:
-                vis1, vis2, vis3 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
-                bispec = vis1 * vis2 * vis3
-                data = torch.angle(bispec) if self._is_torch(bispec) else np.angle(bispec)
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                data = data[mask]
-        
-        elif dtype == 'camp':
-            if dtype not in self.cached_data:
-                obsdata = self.coh_avg_ndarray(self.obs.camp, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = obsdata['camp']
-                self.cached_noise['sigma'+dtype] = obsdata['sigmaca']
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
-                                [obsdata['u2'], obsdata['v2']],
-                                [obsdata['u3'], obsdata['v3']],
-                                [obsdata['u4'], obsdata['v4']]])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
-
-            if parameters is not None:
-                vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
-                data = vis1 * vis2 / (vis3 * vis4)
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                data = data[mask]
-        
-        elif dtype == 'logcamp':
-            if dtype not in self.cached_data:
-                obsdata = self.coh_avg_ndarray(self.obs.logcamp, avg_time=avg_time, scan_avg=scan_avg)
-                self.cached_data[dtype] = obsdata['camp']
-                self.cached_noise['sigma'+dtype] = obsdata['sigmaca']
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], self.cached_noise['sigma'+dtype])
-                self.uv[dtype] = np.array([[obsdata['u1'], obsdata['v1']],
-                                [obsdata['u2'], obsdata['v2']],
-                                [obsdata['u3'], obsdata['v3']],
-                                [obsdata['u4'], obsdata['v4']]])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                self.cached_noise['sigma'+dtype] = self.cached_noise['sigma'+dtype][mask]
-
-            if parameters is not None:
-                vis1, vis2, vis3, vis4 = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
-                if any(self._is_torch(v) for v in [vis1, vis2, vis3, vis4]):
-                    data = torch.log(vis1) + torch.log(vis2) - torch.log(vis3) - torch.log(vis4)
+                vis = self._sample_vis_batched(model, self.uv[dtype], ttype=ttype)
+                if any(utils.is_torch(v) for v in vis):
+                    amplitudes = [torch.abs(v) for v in vis]
+                    data = amplitudes[0] * amplitudes[1] / (amplitudes[2] * amplitudes[3])
+                    if dtype == 'logcamp':
+                        data = torch.log(data)
                 else:
-                    data = np.log(vis1) + np.log(vis2) - np.log(vis3) - np.log(vis4)
+                    amplitudes = [np.abs(v) for v in vis]
+                    data = amplitudes[0] * amplitudes[1] / (amplitudes[2] * amplitudes[3])
+                    if dtype == 'logcamp':
+                        data = np.log(data)
                 mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
                 data = data[mask]
-        
+
         elif dtype == 'ci':
             if dtype not in self.cached_data:
-                adv, adv_noise, adv_metadata = self.calc_advariants(count=self.count, min_sep_time=min_sep_time)
-                real_ci, real_ci_sigma = self.advariants_to_ci(adv, adv_metadata['time'], adv_noise)
-                if self.ci_cov:
-                    noisy_adv, _, noisy_meta = self.calc_advariants(
-                        N=max(1000, 5 * real_ci.size), add_noise=True,
-                        count=self.count, min_sep_time=min_sep_time)
-                    ci_samples, _ = self.advariants_to_ci(noisy_adv, noisy_meta['time'])
-                adv_metadata['ci'], adv_metadata['sigma_ci'] = self.ci_real_to_complex(real_ci, real_ci_sigma)
-                self.ci = self.coh_avg_ndarray(adv_metadata, avg_time=avg_time, scan_avg=scan_avg)
-                n = len(adv_metadata)
-                self._ci_raw_metadata = adv_metadata
+                adv, adv_noise, metadata = self.calc_advariants(count=self.count, min_sep_time=min_sep_time)
+                real_ci, real_ci_sigma = self.advariants_to_ci(adv, metadata['time'], adv_noise)
+                metadata['ci'], metadata['sigma_ci'] = self.ci_real_to_complex(real_ci, real_ci_sigma)
+                self.ci = self.coh_avg_ndarray(metadata, avg_time=avg_time, scan_avg=scan_avg)
+                n = len(metadata)
+                self._ci_raw_metadata = metadata
                 self._ci_average = None
                 if avg_time > 0 or scan_avg:
                     self._ci_average = self._ci_averaging_matrix(n, avg_time, scan_avg)
@@ -542,35 +439,20 @@ class ModelLikelihood(bilby.Likelihood):
                     real_ci_sigma = np.sqrt(np.concatenate([
                         average_squared @ real_ci_sigma[:n]**2,
                         average_squared @ real_ci_sigma[n:]**2]))
-                    if self.ci_cov:
-                        ci_samples = np.concatenate([ci_samples[:, :n] @ average.T,
-                                                     ci_samples[:, n:] @ average.T], axis=1)
-                self.cached_data[dtype] = np.concatenate([self.ci['ci'].real, self.ci['ci'].imag])
-                self.uv[dtype] = np.array([[self.ci['u1'], self.ci['v1']],
-                                         [self.ci['u2'], self.ci['v2']],
-                                         [self.ci['u3'], self.ci['v3']]])
-                mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
-                mask = np.concatenate([mask, mask])
-                self.cached_data[dtype] = self.cached_data[dtype][mask]
-                if self.ci_cov:
-                    ci_samples = ci_samples[:, mask]
-                    cov = np.atleast_2d(np.cov(ci_samples, rowvar=False))
-                    sigma = np.sqrt(np.diag(cov))
-                    self._cache_ci_covariance(cov, self.cached_data[dtype])
-                else:
-                    sigma = real_ci_sigma[mask]
-                self.cached_noise['sigma'+dtype] = self.augment_sigma(self.cached_data[dtype], sigma)
+                values = np.concatenate([self.ci['ci'].real, self.ci['ci'].imag])
+                self._cache_observed_data(dtype, values, real_ci_sigma, self.ci,
+                                          uvdist_sections, n_baselines=3)
 
                 # Model evaluations reuse the original UV coordinates.
-                self._ci_raw_uv = np.array([[adv_metadata['u1'], adv_metadata['v1']],
-                                           [adv_metadata['u2'], adv_metadata['v2']],
-                                           [adv_metadata['u3'], adv_metadata['v3']]])
+                self._ci_raw_uv = np.array([[metadata['u1'], metadata['v1']],
+                                           [metadata['u2'], metadata['v2']],
+                                           [metadata['u3'], metadata['v3']]])
 
             if parameters is not None:
                 metadata = self._ci_raw_metadata
                 n = len(metadata)
                 vis1, vis2, vis3 = self._sample_vis_batched(model, self._ci_raw_uv, ttype=ttype)
-                if any(self._is_torch(v) for v in [vis1, vis2, vis3]):
+                if any(utils.is_torch(v) for v in [vis1, vis2, vis3]):
                     advariants = vis1 * torch.conj(vis2).pow(-1) * vis3
                     data = self.advariants_to_ci_torch(advariants, metadata['time'])
                 else:
@@ -578,297 +460,206 @@ class ModelLikelihood(bilby.Likelihood):
                     data = self.advariants_to_ci(advariants, metadata['time'])[0]
                 if self._ci_average is not None:
                     average = self._ci_average
-                    if self._is_torch(data):
-                        average = self._to_torch(average, like=data)
+                    if utils.is_torch(data):
+                        average = utils.to_torch(average, like=data)
                         data = torch.cat([average @ data[:n], average @ data[n:]])
                     else:
                         data = np.concatenate([average @ data[:n], average @ data[n:]])
                 mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
                 data = data[np.concatenate([mask, mask])]
 
-        return self.cached_data[dtype], self.cached_noise['sigma'+dtype], data
+        if self.use_cov and 'cov_'+dtype not in self.cached_noise:
+            self._cache_observable_covariance(dtype, min_sep_time, uvdist_sections)
+        return self.cached_data[dtype], self.cached_noise['sigma_'+dtype], data
+
+    def _cache_observed_data(self, dtype, values, sigma, metadata, uvdist_sections,
+                             n_baselines=1):
+        """Cache unfiltered UV tracks and filtered values with augmented errors.
+
+        CI values contain real components followed by imaginary components, so
+        both halves use the same baseline mask.
+        """
+        if n_baselines == 1:
+            uv = np.array([metadata['u'], metadata['v']])
+        else:
+            uv = np.array([[metadata[f'u{i}'], metadata[f'v{i}']]
+                           for i in range(1, n_baselines + 1)])
+        self.uv[dtype] = uv
+        mask = self.filter_by_uvdist_ranges(uv, uvdist_sections)
+        if dtype == 'ci':
+            mask = np.concatenate([mask, mask])
+        # Preserve augmentation order and array layout from each sampling path.
+        # Masking a structured-array view first can change floating-point rounding.
+        if dtype in ('camp', 'logcamp', 'ci'):
+            values, sigma = values[mask], sigma[mask]
+            sigma = utils.augment_sigma(values, sigma, self.noise_frac,
+                                        self.static_noise_floor, self.noise_factor)
+        else:
+            sigma = utils.augment_sigma(values, sigma, self.noise_frac,
+                                        self.static_noise_floor, self.noise_factor)[mask]
+            values = values[mask]
+        self.cached_data[dtype] = values
+        self.cached_noise['sigma_'+dtype] = sigma
 
     def _ci_averaging_matrix(self, n_advariants, avg_time, scan_avg):
-        """Build averaging weights in the same row order as coh_avg_ndarray.
+        return self._averaging_matrix(self._ci_raw_metadata, avg_time, scan_avg)
 
-        The averaging plan is populated by the preceding coh_avg_ndarray call.
-        """
-        plan_key = (float(avg_time), bool(scan_avg), 0.0165, 0.0001)
-        plan = self._coh_avg_plan_cache[plan_key]
-        average_rows = []
-        output_times = []
-
+    def _averaging_matrix(self, metadata, avg_time, scan_avg):
+        """Return weights in exactly the row order of coh_avg_ndarray."""
+        n = len(metadata)
+        if n == 0 or (avg_time <= 0 and not scan_avg):
+            return np.eye(n)
+        plan = self._coh_averaging_plan(metadata, avg_time, scan_avg)
+        rows, times = [], []
         for group in plan['group_plans']:
             for j in range(group['n_bins']):
                 indices = group['ord_idx'][group['bin_inv'] == j]
-                weights = np.zeros(n_advariants)
+                weights = np.zeros(n)
                 weights[indices] = 1 / len(indices)
-                average_rows.append(weights)
-                output_times.append(self._ci_raw_metadata['time'][indices].mean())
+                rows.append(weights)
+                times.append(metadata['time'][indices].mean())
+        return np.asarray(rows)[np.argsort(times)]
 
-        # coh_avg_ndarray concatenates groups, then sorts by mean time.
-        order = np.argsort(output_times)
-        return np.asarray(average_rows)[order]
+    def _cache_covariance(self, dtype, cov, features, augment=True):
+        """Cache covariance, inverse, logdet and marginal errors in real features.
 
-    def _cache_ci_covariance(self, cov, data):
-        """Augment and stabilise CI covariance, then cache its inverse and logdet."""
-        extra_variance = (self.noise_frac * np.abs(data))**2 + self.static_noise_floor**2
-        diagonal = np.diag_indices_from(cov)
-        cov[diagonal] += extra_variance
-        cov *= self.noise_factor**2
-
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        if eigenvalues[-1] <= 0:
-            raise ValueError("CI covariance has no positive variance.")
-
-        # Normalisation can leave directions with very small variance.
-        eigenvalues = np.maximum(eigenvalues, 1e-10 * eigenvalues[-1])
-        self.cached_noise['covci'] = (eigenvectors * eigenvalues) @ eigenvectors.T
-        self.cached_noise['invcovci'] = (eigenvectors / eigenvalues) @ eigenvectors.T
-        self.cached_noise['logcovdetci'] = np.log(eigenvalues).sum()
-
-    def log_likelihood_image(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for image data.
-
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for image data.
+        Redundant closures can have singular covariance. Eigenvalues are floored
+        at 1e-10 times the largest eigenvalue, as in the previous CI path.
         """
-        data, sigma, model_data = self.sample_data(parameters, dtype='image')
-        model = data.copy()
-        model._imdict['I'] = model_data.flatten()
-        model = data.align_images([model])[0][0]
-        data_arr = data._imdict['I'].flatten()/data._imdict['I'].sum()
-        model_data = model._imdict['I'].flatten()/model._imdict['I'].sum() 
+        cov = np.asarray(cov, dtype=float).copy()
+        if augment:
+            cov[np.diag_indices_from(cov)] += ((self.noise_frac * np.abs(features))**2
+                                               + self.static_noise_floor**2)
+            cov *= self.noise_factor**2
+        if cov.size:
+            if not np.all(np.isfinite(cov)):
+                raise ValueError(f"Non-finite {dtype} covariance; check zero or low-SNR visibilities")
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            if eigenvalues[-1] <= 0:
+                raise ValueError(f"{dtype} covariance has no positive variance")
+            eigenvalues = np.maximum(eigenvalues, 1e-10 * eigenvalues[-1])
+            cov = (eigenvectors * eigenvalues) @ eigenvectors.T
+            inverse = (eigenvectors / eigenvalues) @ eigenvectors.T
+            logdet = np.log(eigenvalues).sum()
+        else:
+            inverse, logdet = cov.copy(), 0.
+        self.cached_noise['cov_'+dtype] = cov
+        self.cached_noise['invcov_'+dtype] = inverse
+        self.cached_noise['logcovdet_'+dtype] = logdet
+        diagonal = np.diag(cov)
+        if dtype in ('vis', 'bispec'):
+            n = len(diagonal) // 2
+            # sample_data retains one representative component error per complex datum.
+            sigma = np.sqrt((diagonal[:n] + diagonal[n:]) / 2)
+        else:
+            sigma = np.sqrt(diagonal)
+        self.cached_noise['sigma_'+dtype] = sigma
 
-        # data_arr = data._imdict['I'].flatten()/data._imdict['I'].sum()
-        # model_data = model_data.flatten()/model_data.sum()
+    def _cache_observable_covariance(self, dtype, min_sep_time, uvdist_sections):
+        """Propagate visibility noise through the same operations as sample_data."""
+        observed = self.cached_data[dtype]
+        if dtype == 'vis':
+            # Already averaged, filtered and augmented analytical component errors.
+            variance = self.cached_noise['sigma_vis']**2
+            self._cache_covariance(dtype, np.diag(np.r_[variance, variance]),
+                                   utils.real_features(observed), augment=False)
+            return
+        N = max(self.cov_samples, 5 * observed.size * (2 if dtype == 'bispec' else 1))
+        samples, metadata = self._draw_observable_samples(
+            dtype, N, min_sep_time, visibility_metadata=self._reorder_obsdata_ndarray(self.obs)
+            if dtype == 'visamp' else None)
+        average = self._averaging_matrix(metadata, self.avg_time, self.scan_avg)
+        if dtype == 'ci':
+            n = len(metadata)
+            samples = np.concatenate([samples[:, :n] @ average.T,
+                                      samples[:, n:] @ average.T], axis=1)
+        else:
+            samples = samples @ average.T
+            samples = self._transform_observable_samples(dtype, samples)
+        mask = self.filter_by_uvdist_ranges(self.uv[dtype], uvdist_sections)
+        if dtype == 'ci':
+            mask = np.r_[mask, mask]
+        samples = samples[:, mask]
+        if dtype == 'cphase':
+            samples = np.angle(np.exp(1j * (samples - observed)))
+        if np.iscomplexobj(samples):
+            samples = np.concatenate([samples.real, samples.imag], axis=1)
+        cov = np.atleast_2d(np.cov(samples, rowvar=False)) if samples.shape[1] else np.empty((0, 0))
+        features = utils.real_features(observed)
+        if dtype == 'bispec':
+            # Apply the same amplitude-based noise floor to each complex component.
+            features = np.tile(np.abs(observed), 2)
+        self._cache_covariance(dtype, cov, features)
 
-        residual = data_arr - model_data
-        logL = -0.5 * np.sum(np.abs((residual / sigma) ** 2) + np.log(2 * np.pi * sigma ** 2))
-        return logL
+    def _term_covariance(self, dtype, logcovdet, invcov):
+        if self.use_cov:
+            return (self.cached_noise['logcovdet_'+dtype],
+                    self.cached_noise['invcov_'+dtype])
+        return logcovdet, invcov
 
-    def log_likelihood_vis(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for visibility data.
+    def _covariance_term_loglike(self, dtype, data, model_data, logcovdet, invcov):
+        if dtype == 'cphase':
+            if utils.is_torch(model_data):
+                residual = utils.to_torch(data, like=model_data) - model_data
+                residual = torch.atan2(torch.sin(residual), torch.cos(residual))
+            else:
+                residual = np.angle(np.exp(1j * (data - model_data)))
+            return self._covariance_loglike(residual, residual * 0, logcovdet, invcov)
+        return self._covariance_loglike(utils.real_features(data),
+                                       utils.real_features(model_data), logcovdet, invcov)
 
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for visibility data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for visibility data. If provided, it will be used in the likelihood calculation.
+    def _log_likelihood_dtype(self, parameters, dtype, logcovdet=None, invcov=None):
+        """Evaluate one term, sampling before retrieving cached covariance.
 
-        Returns
-        -------
-        logL : float
-            The log-likelihood for visibility data.
+        Explicit logcovdet/invcov are used when use_cov is False. Complex
+        covariance features and phase wrapping are handled by the covariance
+        helper; the diagonal closure-phase path keeps its cosine residual.
         """
-        data, sigma, model_data = self.sample_data(parameters, dtype='vis', ttype='analytical')
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
-
-    def log_likelihood_visamp(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for visibility amplitude data.
-
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for visibility amplitude data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for visibility amplitude data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for visibility amplitude data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='visamp', ttype='analytical')
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
-
-    def log_likelihood_bispec(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for bispectrum data.
-        
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for bispectrum data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for bispectrum data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for bispectrum data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='bispec', ttype='analytical')
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
-
-    def log_likelihood_cphase(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for closure phase data.
-
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for closure phase data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for closure phase data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for closure phase data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='cphase', ttype='analytical')
-        if self._is_torch(model_data):
-            data_t = self._to_torch(data, like=model_data)
-            sigma_t = self._to_torch(sigma, like=model_data)
+        data, sigma, model_data = self.sample_data(parameters, dtype=dtype, ttype='analytical')
+        logcovdet, invcov = self._term_covariance(dtype, logcovdet, invcov)
+        if dtype != 'cphase':
+            if logcovdet is not None and invcov is not None:
+                return self._covariance_term_loglike(dtype, data, model_data, logcovdet, invcov)
+            return self._gaussian_loglike(data, model_data, sigma)
+        if utils.is_torch(model_data):
+            data_t = utils.to_torch(data, like=model_data)
+            sigma_t = utils.to_torch(sigma, like=model_data)
             residual = 1 - torch.cos(data_t - model_data)
             if logcovdet is not None and invcov is not None:
-                return self._covariance_loglike(data_t, model_data, logcovdet, invcov)
+                return self._covariance_term_loglike('cphase', data_t, model_data, logcovdet, invcov)
             return -0.5 * torch.sum(residual / sigma_t ** 2 + torch.log(2 * torch.pi * sigma_t ** 2))
         residual = 1 - np.cos(data - model_data)
         if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
+            return self._covariance_term_loglike('cphase', data, model_data, logcovdet, invcov)
         return -0.5 * np.sum(residual / sigma ** 2 + np.log(2 * np.pi * sigma ** 2))
 
+    def log_likelihood_vis(self, parameters, logcovdet=None, invcov=None):
+        """Evaluate the visibility likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'vis', logcovdet, invcov)
+
+    def log_likelihood_visamp(self, parameters, logcovdet=None, invcov=None):
+        """Evaluate the visibility amplitude likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'visamp', logcovdet, invcov)
+
+    def log_likelihood_bispec(self, parameters, logcovdet=None, invcov=None):
+        """Evaluate the bispectrum likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'bispec', logcovdet, invcov)
+
+    def log_likelihood_cphase(self, parameters, logcovdet=None, invcov=None):
+        """Evaluate the closure phase likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'cphase', logcovdet, invcov)
+
     def log_likelihood_camp(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for closure amplitude data.
-
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for closure amplitude data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for closure amplitude data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for closure amplitude data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='camp', ttype='analytical')
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
+        """Evaluate the closure amplitude likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'camp', logcovdet, invcov)
 
     def log_likelihood_logcamp(self, parameters, logcovdet=None, invcov=None):
-        """Calculate the log-likelihood for log closure amplitude data.
+        """Evaluate the log closure amplitude likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'logcamp', logcovdet, invcov)
 
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for log closure amplitude data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for log closure amplitude data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for log closure amplitude data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='logcamp', ttype='analytical')
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
-
-    def log_likelihood_ci(self, parameters, logcovdet=None, invcov=None): 
-        """Calculate the log-likelihood for closure invariant data.
-
-        Parameters
-        ----------
-        parameters : dict
-            The model parameters.
-        logcovdet : np.ndarray, optional
-            The log-determinant of the covariance matrix for closure invariant data. If provided, it will be used in the likelihood calculation.
-        invcov : np.ndarray, optional
-            The inverse of the covariance matrix for closure invariant data. If provided, it will be used in the likelihood calculation.
-
-        Returns
-        -------
-        logL : float
-            The log-likelihood for closure invariant data.
-        """
-        data, sigma, model_data = self.sample_data(parameters, dtype='ci', ttype='analytical')
-        if self.ci_cov:
-            if invcov is None:
-                invcov = self.cached_noise.get('invcovci')
-            if logcovdet is None:
-                logcovdet = self.cached_noise.get('logcovdetci')
-        else:
-            invcov = logcovdet = None
-        if logcovdet is not None and invcov is not None:
-            return self._covariance_loglike(data, model_data, logcovdet, invcov)
-        return self._gaussian_loglike(data, model_data, sigma)
-
-    def augment_sigma(self, data, sigma):
-        """Augment the noise by adding additional noise in quadrature.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            The observed data.
-        sigma : np.ndarray
-            The original noise standard deviation.
-
-        Returns
-        -------
-        augmented_sigma : np.ndarray
-            The augmented noise standard deviation.
-        """
-        augmented_sigma = np.sqrt(sigma**2 + (self.noise_frac * np.abs(data))**2 + self.static_noise_floor**2) * self.noise_factor
-        return augmented_sigma
-
-    def tri_minimal_set(self, sites, tarr, tkey):
-        """Determine a minimal set of triangles for closure calculation based on the available sites and their order in the observation.
-
-        Parameters
-        ----------
-        sites : list
-            The list of sites available in the current data.
-        tarr : np.ndarray
-            The array of times and corresponding sites from the observation.
-        tkey : str
-            The key in tarr that corresponds to the site identifiers.
-
-        Returns
-        -------
-        tris : list of tuples
-            A list of tuples, each containing three sites that form a triangle for closure calculation.
-        """
-
-        # determine ordering and reference site based on order of  self.tarr
-        sites_ordered = [x for x in tarr['site'] if x in sites]
-        ref = sites_ordered[0]
-        sites_ordered.remove(ref)
-
-        # Find all triangles that contain the ref
-        tris = list(it.combinations(sites_ordered, 2))
-        tris = [(ref, t[0], t[1]) for t in tris]
-
-        return tris
+    def log_likelihood_ci(self, parameters, logcovdet=None, invcov=None):
+        """Evaluate the closure invariant likelihood; see _log_likelihood_dtype."""
+        return self._log_likelihood_dtype(parameters, 'ci', logcovdet, invcov)
 
     def calc_advariants(self, N=1, add_noise=False, count='min', min_sep_time=0):
         """Calculate the advariants from the observational data.
@@ -891,14 +682,130 @@ class ModelLikelihood(bilby.Likelihood):
         advariants_noise : np.ndarray
             Component standard deviations packed as sigma_real + 1j * sigma_imag.
             They are equal under the circular visibility-noise approximation.
-        adv_metadata : np.ndarray
+        metadata : np.ndarray
             Structured metadata for each advariant sample.
         """
-        tlist = self.obs.tlist(conj=True)
+        return self._calc_triangle_products(N, add_noise, count, min_sep_time, 'adv')
+
+    def calc_bispectrum(self, N=1, add_noise=False, count='min', min_sep_time=0):
+        """Return triangle visibility products, component errors and metadata.
+
+        Metadata contains time, stations, directed UV coordinates, bispec and
+        sigma_bispec. sigma_bispec is the first-order standard deviation of either complex
+        component. Noise samples share draws for repeated physical baselines.
+        """
+        return self._calc_triangle_products(N, add_noise, count, min_sep_time, 'bispec')
+
+    @staticmethod
+    def sample_visibility_noise(visibilities, sigmas, baseline_keys, N):
+        """Draw circular Gaussian visibility noise with shared baseline errors.
+
+        Each input sequence contains one array per baseline position in an
+        observable. Keys are (physical_baseline_id, conjugated) pairs. Repeated
+        IDs reuse a draw, conjugated when required. Results have shape (N, M).
+        This sampler can also be used with quadrangles and other observables.
+        """
+        if not isinstance(N, (int, np.integer)) or N < 1:
+            raise ValueError("N must be a positive integer")
+        draws = {}
+        samples = []
+        for values, errors, keys in zip(visibilities, sigmas, baseline_keys):
+            columns = []
+            for (key, conjugated), sigma in zip(keys, errors):
+                if key not in draws:
+                    draws[key] = sigma * (np.random.normal(size=N) + 1j * np.random.normal(size=N))
+                columns.append(draws[key].conj() if conjugated else draws[key])
+            noise = np.column_stack(columns) if columns else np.empty((N, 0), complex)
+            samples.append(np.asarray(values)[None, :] + noise)
+        return samples
+
+    def _visibility_time_groups(self):
+        """Group obs.data by time and include conjugate directed baselines."""
+        # Construct directed baselines from the visibility table alone.
+        raw = self.obs.data
+        tlist = []
+        for time in np.unique(raw['time']):
+            rows = raw[raw['time'] == time]
+            reverse = rows.copy()
+            reverse['t1'], reverse['t2'] = rows['t2'], rows['t1']
+            reverse['u'], reverse['v'] = -rows['u'], -rows['v']
+            reverse['vis'] = rows['vis'].conj()
+            tlist.append(np.concatenate([rows, reverse]))
+        return tlist
+
+    def calc_camp(self, N=1, add_noise=False, count='min', min_sep_time=0):
+        """Calculate un-debiased closure amplitudes from visibility quadrangles.
+
+        Baseline order is (12), (34), (14), (23), giving |V12 V34/V14 V23|.
+        Return values, first-order standard deviations and metadata containing
+        time, t1..t4, u1/v1..u4/v4, camp and sigma_camp. Noisy outputs retain
+        shape (N, quadrangles); deterministic outputs have shape (quadrangles,).
+        Shared visibility draws preserve correlations between quadrangles.
+        """
+        if count not in ('min', 'max'):
+            raise ValueError("count must be 'min' or 'max'")
+        if not isinstance(N, (int, np.integer)) or N < 1:
+            raise ValueError("N must be a positive integer")
+        N = N if add_noise else 1
+        metadata_dtype = np.dtype(
+            [('time', '<f8')] + [(f't{i}', '<U32') for i in range(1, 5)] +
+            [(name, '<f8') for i in range(1, 5) for name in (f'u{i}', f'v{i}')] +
+            [('camp', '<f8'), ('sigma_camp', '<f8')])
+        entries, baselines = [], []
+        last_time = {}
+        for rows in self._visibility_time_groups():
+            sites = sorted(set(rows['t1']) | set(rows['t2']))
+            if len(sites) < 4:
+                continue
+            lookup = {(row['t1'], row['t2']): row for row in rows}
+            if count == 'min':
+                quads = utils.quad_minimal_set(sites, self.obs.tarr, self.obs.tkey)
+            else:
+                quads = [quad for a, b, c, d in it.combinations(sites, 4)
+                         for quad in ((a, b, c, d), (a, c, b, d), (a, b, d, c))]
+            for quad in quads:
+                quad = tuple(quad)
+                a, b, c, d = quad
+                try:
+                    selected = [lookup[pair] for pair in ((a, b), (c, d), (a, d), (b, c))]
+                except KeyError:
+                    continue
+                time = float(rows['time'][0])
+                if quad in last_time and time - last_time[quad] < min_sep_time / 3600:
+                    continue
+                last_time[quad] = time
+                entries.append((time, *quad, *[value for row in selected for value in (row['u'], row['v'])]))
+                baselines.append(selected)
+        if not baselines:
+            empty = np.empty((N, 0)) if add_noise else np.empty(0)
+            return empty, empty.copy(), np.empty(0, dtype=metadata_dtype)
+        vis = [np.array([rows[i]['vis'] for rows in baselines]) for i in range(4)]
+        sigmas = [np.array([rows[i]['sigma'] for rows in baselines]) for i in range(4)]
+        if add_noise:
+            keys = [[((float(row[i]['time']), *sorted((str(row[i]['t1']), str(row[i]['t2'])))),
+                      str(row[i]['t1']) > str(row[i]['t2'])) for row in baselines]
+                    for i in range(4)]
+            vis = self.sample_visibility_noise(vis, sigmas, keys, N)
+        a, b, c, d = [np.abs(v) for v in vis]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            values = a * b / (c * d)
+            # Derivative form avoids 0/0 for zero numerator amplitudes.
+            errors = np.sqrt((sigmas[0] * b / (c*d))**2 +
+                             (sigmas[1] * a / (c*d))**2 +
+                             (sigmas[2] * values / c)**2 +
+                             (sigmas[3] * values / d)**2)
+        first_values = values[0] if add_noise else values
+        first_errors = errors[0] if add_noise else errors
+        metadata = np.array([(*entry, value, error) for entry, value, error
+                             in zip(entries, first_values, first_errors)], dtype=metadata_dtype)
+        return values, errors, metadata
+
+    def _calc_triangle_products(self, N, add_noise, count, min_sep_time, product):
+        tlist = self._visibility_time_groups()
         if not add_noise:
             N = 1
 
-        adv_metadata_dtype = np.dtype([
+        metadata_dtype = np.dtype([
             ('time', '<f8'),
             ('t1', '<U32'),
             ('t2', '<U32'),
@@ -909,12 +816,15 @@ class ModelLikelihood(bilby.Likelihood):
             ('v2', '<f8'),
             ('u3', '<f8'),
             ('v3', '<f8'),
-            ('adv', '<c16'),
-            ('sigma', '<c16'),
-            ('ci', '<c16'),
-            ('sigma_ci', '<c16'),
         ])
-        adv_metadata_rows = []
+        if product == 'bispec':
+            metadata_dtype = np.dtype(metadata_dtype.descr +
+                                          [('bispec', '<c16'), ('sigma_bispec', '<f8')])
+        elif product == 'adv':
+            metadata_dtype = np.dtype(metadata_dtype.descr +
+                                            [('adv', '<c16'), ('sigma_adv', '<c16'), ('ci', '<c16'), ('sigma_ci', '<c16')])
+
+        metadata_rows = []
         triad_time_dict = {}
 
         v1s, v2s, v3s = [], [], []
@@ -924,7 +834,7 @@ class ModelLikelihood(bilby.Likelihood):
 
         for tdata in tlist:
             tdata = tdata.astype(self.obs.data.dtype)
-            sites = list(set(np.hstack((tdata['t1'], tdata['t2']))))
+            sites = sorted(set(np.hstack((tdata['t1'], tdata['t2']))))
 
             # Create a dictionary of baselines at the current time incl. conjugates;
             l_dict = {}
@@ -934,9 +844,10 @@ class ModelLikelihood(bilby.Likelihood):
             if count == 'max':
                 tris = np.sort(list(it.combinations(sites, 3)))
             else:
-                tris = self.tri_minimal_set(sites, self.obs.tarr, self.obs.tkey)
+                tris = utils.tri_minimal_set(sites, self.obs.tarr, self.obs.tkey)
 
             for tri in tris:
+                tri = tuple(tri)
                 try:
                     # Select triangle entries in the data dictionary
                     l1 = l_dict[(tri[0], tri[1])]
@@ -980,48 +891,48 @@ class ModelLikelihood(bilby.Likelihood):
         if len(v1s) == 0:
             advariants = np.empty((N, 0), dtype=np.complex128)
             advariants_noise = np.empty((N, 0), dtype=np.complex128)
-            adv_metadata = np.array(adv_metadata_rows, dtype=adv_metadata_dtype)
-            return np.squeeze(advariants), np.squeeze(advariants_noise), adv_metadata
+            metadata = np.array(metadata_rows, dtype=metadata_dtype)
+            return (advariants if add_noise else advariants[0],
+                    advariants_noise.real if product == 'bispec' and add_noise else
+                    advariants_noise[0].real if product == 'bispec' else
+                    advariants_noise if add_noise else advariants_noise[0], metadata)
 
         v1, v2, v3 = [np.asarray(x, dtype=np.complex128) for x in (v1s, v2s, v3s)]
         s1, s2, s3 = [np.asarray(x, dtype=np.float64) for x in (s1s, s2s, s3s)]
 
         if add_noise:
-            draws = {}
-            noise = []
-            for keys, sigmas in zip(baseline_keys, (s1, s2, s3)):
-                columns = []
-                for (key, conjugated), sigma in zip(keys, sigmas):
-                    if key not in draws:
-                        draws[key] = sigma * (np.random.normal(size=N) + 1j * np.random.normal(size=N))
-                    columns.append(draws[key].conj() if conjugated else draws[key])
-                noise.append(np.column_stack(columns))
-            noise_v1, noise_v2, noise_v3 = noise
-            v1, v2, v3 = v1[None, :] + noise_v1, v2[None, :] + noise_v2, v3[None, :] + noise_v3
+            v1, v2, v3 = self.sample_visibility_noise(
+                (v1, v2, v3), (s1, s2, s3), baseline_keys, N)
 
-        adv = v1 * np.conj(v2)**(-1) * v3
-        relative_variance = ((s1[None, :] / np.abs(v1))**2
-                             + (s2[None, :] / np.abs(v2))**2
-                             + (s3[None, :] / np.abs(v3))**2)
-        adv_noise = np.sqrt(relative_variance) * np.abs(adv)
+        adv = v1 * v2 * v3 if product == 'bispec' else v1 * np.conj(v2)**(-1) * v3
+        if product == 'bispec':
+            adv_noise = np.sqrt((s1 * np.abs(v2 * v3))**2
+                                + (s2 * np.abs(v1 * v3))**2
+                                + (s3 * np.abs(v1 * v2))**2)
+            adv_noise = np.atleast_2d(adv_noise)
+        else:
+            relative_variance = ((s1[None, :] / np.abs(v1))**2
+                                 + (s2[None, :] / np.abs(v2))**2
+                                 + (s3[None, :] / np.abs(v3))**2)
+            adv_noise = np.sqrt(relative_variance) * np.abs(adv)
 
         advariants = np.asarray(adv, dtype=np.complex128)
-        # Circular visibility noise remains circular under the first-order
-        # (conjugate-)complex derivatives of v1 * v3 / conj(v2).
-        # Each input sigma is a per-real-component standard deviation, as in MC.
         advariants_noise = np.asarray(adv_noise * (1 + 1j), dtype=np.complex128)
         adv0 = advariants[0] if advariants.ndim > 1 else advariants
         adv_noise0 = advariants_noise[0] if advariants_noise.ndim > 1 else advariants_noise
-        advariants = np.squeeze(advariants.reshape(N, -1))
-        advariants_noise = np.squeeze(advariants_noise.reshape(N, -1))
+        advariants = advariants.reshape(N, -1) if add_noise else advariants.reshape(-1)
+        advariants_noise = advariants_noise.reshape(N, -1) if add_noise else advariants_noise.reshape(-1)
 
-        adv_metadata_rows = [
-            (*entry, adv0[idx], adv_noise0[idx], np.nan, np.nan)
-            for idx, entry in enumerate(metadata_entries)
-        ]
-        adv_metadata = np.array(adv_metadata_rows, dtype=adv_metadata_dtype)
+        if product == 'bispec':
+            metadata_rows = [(*entry, adv0[idx], adv_noise0[idx].real)
+                             for idx, entry in enumerate(metadata_entries)]
+            advariants_noise = advariants_noise.real
+        else:
+            metadata_rows = [(*entry, adv0[idx], adv_noise0[idx], np.nan, np.nan)
+                             for idx, entry in enumerate(metadata_entries)]
+        metadata = np.array(metadata_rows, dtype=metadata_dtype)
 
-        return advariants, advariants_noise, adv_metadata
+        return advariants, advariants_noise, metadata
     
     def advariants_to_ci(self, advariants, times, advariants_noise=None):
         """Normalise advariants to closure invariants using uncertainty propagation.
@@ -1105,47 +1016,67 @@ class ModelLikelihood(bilby.Likelihood):
             self._ci_group_cache = cached
         return cached[1:]
 
-    def estimate_noise_ci(self, N=5000, calc_cov=True): # MC-style, assuming Gaussian noise on visibilities and propagating to closure invariants
-        """Estimate the noise for closure invariant data.
+    def _draw_observable_samples(self, dtype, N, min_sep_time, visibility_metadata=None):
+        """Return MC samples and metadata before averaging and final transforms.
 
-        Returns
-        -------
-        sigma_ci : np.ndarray
-            The estimated noise for closure invariant data.
-        covariance_ci : np.ndarray
-            The estimated covariance matrix for closure invariant data.
+        CI is normalized at each original timestamp. Visibility amplitudes,
+        closure phases and log closure amplitudes are transformed by the caller
+        after any averaging, matching the corresponding observed-data path.
         """
-
-        advariants_noisy, _, adv_metadata = self.calc_advariants(N=N, add_noise=True, count=self.count)
-        ci_noisy_samples, _ = self.advariants_to_ci(advariants_noisy, adv_metadata['time'])
-        if calc_cov:
-            covariance_ci = np.cov(ci_noisy_samples, rowvar=False)
-            sigma_ci = np.sqrt(np.diag(covariance_ci))
-            return sigma_ci, covariance_ci
+        if dtype == 'visamp':
+            metadata = self.obs.data if visibility_metadata is None else visibility_metadata
+            keys = [((float(row['time']), *sorted((str(row['t1']), str(row['t2'])))),
+                     str(row['t1']) > str(row['t2'])) for row in metadata]
+            samples = self.sample_visibility_noise(
+                [metadata['vis']], [metadata['sigma']], [keys], N)[0]
         else:
-            sigma_ci = np.std(ci_noisy_samples, axis=0, ddof=1)
-            return sigma_ci, None
+            if dtype in ('bispec', 'cphase'):
+                calculate = self.calc_bispectrum
+            elif dtype in ('camp', 'logcamp'):
+                calculate = self.calc_camp
+            elif dtype == 'ci':
+                calculate = self.calc_advariants
+            else:
+                raise ValueError("Unsupported dtype: " + str(dtype))
+            samples, _, metadata = calculate(
+                N=N, add_noise=True, count=self.count, min_sep_time=min_sep_time)
+            if dtype == 'ci':
+                samples, _ = self.advariants_to_ci(samples, metadata['time'])
+        return samples, metadata
 
-    def calc_uvdist(self, uv_arr):
-        """Calculate the UV distance for a given array of UV coordinates.
+    @staticmethod
+    def _transform_observable_samples(dtype, samples):
+        """Apply the final observable transform after any averaging."""
+        if dtype == 'visamp':
+            return np.abs(samples)
+        if dtype == 'cphase':
+            return np.angle(samples)
+        if dtype == 'logcamp':
+            return np.log(samples)
+        return samples
 
-        Parameters
-        ----------
-        uv_arr : np.ndarray
-            The array of UV coordinates with shape (N, 2), where N is the number of baselines.
+    def estimate_noise(self, dtype='ci', N=5000, calc_cov=True, min_sep_time=0):
+        """Estimate raw observable errors and covariance from visibility noise.
 
-        Returns
-        -------
-        uvdist : np.ndarray
-            The UV distance for each baseline.
+        Visibility and bispectrum features are [real, imaginary]; closure phases are radians,
+        wrapped about the observed phase to avoid the +/-pi discontinuity.
+        These samples precede averaging, UV filtering and noise augmentation.
+        Other observables can reuse sample_visibility_noise and utils.estimate_mc_noise.
         """
-        if uv_arr.ndim == 2:
-            uvdist = np.sqrt(uv_arr[0]**2 + uv_arr[1]**2)
-        else:
-            uvdist = np.array([np.sqrt(uv_arr[j][0]**2 + uv_arr[j][1]**2) for j in range(len(uv_arr))])
-            uvdist = np.sum(uvdist, axis=0)
-        return uvdist
-    
+        if dtype == 'vis':
+            variance = np.tile(self.obs.data['sigma']**2, 2)
+            return np.sqrt(variance), np.diag(variance) if calc_cov else None
+        samples, _ = self._draw_observable_samples(dtype, N, min_sep_time)
+        samples = self._transform_observable_samples(dtype, samples)
+        if dtype == 'cphase':
+            observed, _, _ = self.calc_bispectrum(count=self.count, min_sep_time=min_sep_time)
+            samples = np.angle(np.exp(1j * (samples - np.angle(observed))))
+        return utils.estimate_mc_noise(samples, calc_cov=calc_cov)
+
+    def estimate_noise_ci(self, N=5000, calc_cov=True):
+        """Backward-compatible wrapper for closure invariant Monte Carlo errors."""
+        return self.estimate_noise('ci', N=N, calc_cov=calc_cov)
+
     def filter_by_uvdist_ranges(self, uv, uv_ranges):
         if uv_ranges is None:
             return np.ones(np.asarray(uv).shape[-1], dtype=bool)
@@ -1156,7 +1087,7 @@ class ModelLikelihood(bilby.Likelihood):
         key = (uv.shape, uv.dtype.str, ranges)
         cached = self._uv_mask_cache.get(key)
         if cached is None or not np.array_equal(cached[0], uv):
-            uvdists = self.calc_uvdist(uv)
+            uvdists = utils.calc_uvdist(uv)
             mask = np.zeros_like(uvdists, dtype=bool)
             for uv_min, uv_max in ranges:
                 mask |= (uvdists >= uv_min) & (uvdists <= uv_max)
@@ -1210,7 +1141,7 @@ class ModelLikelihood(bilby.Likelihood):
 
         for i, (title, dtype) in enumerate(dterms.items()):
             data, sigma, model_data = self.sample_data(parameters, dtype=dtype, ttype='analytical', avg_time=avg_time, scan_avg=scan_avg, uvdist_sections=None)
-            uvdist = self.calc_uvdist(self.uv[dtype])
+            uvdist = utils.calc_uvdist(self.uv[dtype])
 
             if title == 'Visibility Phase':
                 sigma = np.real(sigma/np.abs(data))  # phase error approximation
@@ -1339,6 +1270,96 @@ class ModelLikelihood(bilby.Likelihood):
 
         return scanlist
 
+    def _coh_averaging_plan(self, data_array, avg_time, scan_avg, dt=0.0165, margin=0.0001):
+        """Build or reuse the grouping shared by table and matrix averaging."""
+        dtype = data_array.dtype
+        names = dtype.names
+
+        tn_cols = [c for c in names if c.startswith('t') and c != 'time']
+        sigma_cols = [c for c in names if 'sigma' in c]
+        mean_cols = [c for c in names if c not in tn_cols + sigma_cols + ['time']]
+
+        if not hasattr(self, "_coh_avg_plan_cache"):
+            self._coh_avg_plan_cache = {}
+            self._coh_avg_plan_cache_base = None
+
+        t = data_array['time']
+        base_sig = (len(data_array), dtype.descr, tuple(tn_cols), t.dtype.str,
+                    float(t[0]) if len(t) else None, float(t[-1]) if len(t) else None)
+
+        if self._coh_avg_plan_cache_base != base_sig:
+            self._coh_avg_plan_cache.clear()
+            self._coh_avg_plan_cache_base = base_sig
+
+        plan_key = (float(avg_time), bool(scan_avg), float(dt), float(margin))
+        plan = self._coh_avg_plan_cache.get(plan_key)
+
+        if plan is not None:
+            return plan
+
+        all_time = data_array['time']
+
+        # Group rows by tn_cols
+        if tn_cols:
+            key_dtype = [(c, data_array.dtype[c]) for c in tn_cols]
+            keys = np.empty(len(data_array), dtype=key_dtype)
+            for c in tn_cols:
+                keys[c] = data_array[c]
+            _, group_inv = np.unique(keys, return_inverse=True)
+            n_groups = int(group_inv.max()) + 1
+        else:
+            group_inv = np.zeros(len(data_array), dtype=np.int64)
+            n_groups = 1
+
+        group_plans = []
+        for gid in range(n_groups):
+            grp_idx = np.flatnonzero(group_inv == gid)
+            if grp_idx.size == 0:
+                continue
+
+            # Stable sort by time
+            ord_local = np.argsort(all_time[grp_idx], kind='mergesort')
+            ord_idx = grp_idx[ord_local]
+            tg = all_time[ord_idx]
+
+            if scan_avg:
+                avg_interval = np.asarray(self.add_scans(tg, dt=dt, margin=margin))
+                starts = avg_interval[:, 0]
+                ends = avg_interval[:, 1]
+                b = np.searchsorted(starts, tg, side='right') - 1
+                valid = (b >= 0) & (tg <= ends[np.clip(b, 0, len(ends) - 1)])
+                if not np.any(valid):
+                    continue
+                ord_idx = ord_idx[valid]
+                tg = tg[valid]
+                b = b[valid]
+                _, bin_inv = np.unique(b, return_inverse=True)
+            elif avg_time == 0:
+                _, bin_inv = np.unique(tg, return_inverse=True)
+            else:
+                # Each bin starts at its first sample, rather than a fixed grid.
+                avg_t = avg_time / 3600.0
+                bin_inv = np.zeros(tg.size, dtype=np.int64)
+                b = 0
+                bin_start = tg[0]
+                for i in range(1, tg.size):
+                    if tg[i] - bin_start >= avg_t:
+                        b += 1
+                        bin_start = tg[i]
+                    bin_inv[i] = b
+
+            n_bins = int(bin_inv.max()) + 1
+            counts = np.bincount(bin_inv, minlength=n_bins).astype(np.float64)
+
+            group_plans.append(dict(ord_idx=ord_idx, t_sorted=tg, bin_inv=bin_inv,
+                                    counts=counts, n_bins=n_bins, tn_ref_idx=ord_idx[0]))
+
+        plan = dict(group_plans=group_plans, tn_cols=tn_cols, mean_cols=mean_cols,
+                    sigma_cols=sigma_cols, dtype=dtype)
+        self._coh_avg_plan_cache[plan_key] = plan
+
+        return plan
+
     def coh_avg_ndarray(self, data_array, avg_time=0, scan_avg=True, dt=0.0165, margin=0.0001):
         """
         Coherently average the data array over time or over scans.
@@ -1363,114 +1384,12 @@ class ModelLikelihood(bilby.Likelihood):
             The coherently averaged data array.
         """
 
-        if avg_time <= 0 and not scan_avg:
+        if len(data_array) == 0 or (avg_time <= 0 and not scan_avg):
             return data_array
 
+        plan = self._coh_averaging_plan(data_array, avg_time, scan_avg, dt, margin)
         dtype = data_array.dtype
-        names = dtype.names
-
-        tn_cols = [c for c in names if c.startswith('t') and c != 'time']
-        sigma_cols = [c for c in names if 'sigma' in c]
-        mean_cols = [c for c in names if c not in tn_cols + sigma_cols + ['time']]
-
-        # ---------- cache init ----------
-        if not hasattr(self, "_coh_avg_plan_cache"):
-            self._coh_avg_plan_cache = {}
-            self._coh_avg_plan_cache_base = None
-
-        # Cache signature
-        t = data_array['time']
-        base_sig = (
-            len(data_array),
-            dtype.descr,
-            tuple(tn_cols),
-            t.dtype.str,
-            float(t[0]) if len(t) else None,
-            float(t[-1]) if len(t) else None,
-        )
-
-        if self._coh_avg_plan_cache_base != base_sig:
-            self._coh_avg_plan_cache.clear()
-            self._coh_avg_plan_cache_base = base_sig
-
-        plan_key = (float(avg_time), bool(scan_avg), float(dt), float(margin))
-        plan = self._coh_avg_plan_cache.get(plan_key)
-
-        # ---------- build plan if signature not in cache ----------
-        if plan is None:
-            all_time = data_array['time']
-
-            # Group rows by tn_cols
-            if tn_cols:
-                key_dtype = [(c, data_array.dtype[c]) for c in tn_cols]
-                keys = np.empty(len(data_array), dtype=key_dtype)
-                for c in tn_cols:
-                    keys[c] = data_array[c]
-                _, group_inv = np.unique(keys, return_inverse=True)
-                n_groups = int(group_inv.max()) + 1
-            else:
-                group_inv = np.zeros(len(data_array), dtype=np.int64)
-                n_groups = 1
-
-            group_plans = []
-            for gid in range(n_groups):
-                grp_idx = np.flatnonzero(group_inv == gid)
-                if grp_idx.size == 0:
-                    continue
-
-                # Stable sort by time
-                ord_local = np.argsort(all_time[grp_idx], kind='mergesort')
-                ord_idx = grp_idx[ord_local]
-                tg = all_time[ord_idx]
-
-                if scan_avg:
-                    avg_interval = np.asarray(self.add_scans(tg, dt=dt, margin=margin))
-                    starts = avg_interval[:, 0]
-                    ends = avg_interval[:, 1]
-                    b = np.searchsorted(starts, tg, side='right') - 1
-                    valid = (b >= 0) & (tg <= ends[np.clip(b, 0, len(ends) - 1)])
-                    if not np.any(valid):
-                        continue
-                    ord_idx = ord_idx[valid]
-                    tg = tg[valid]
-                    b = b[valid]
-                    _, bin_inv = np.unique(b, return_inverse=True)
-                else:
-                    if avg_time == 0:
-                        # one bin per unique timestamp
-                        _, bin_inv = np.unique(tg, return_inverse=True)
-                    else:
-                        # dynamic-edge semantics (same as your old function)
-                        avg_t = avg_time / 3600.0
-                        bin_inv = np.zeros(tg.size, dtype=np.int64)
-                        b = 0
-                        bin_start = tg[0]
-                        for i in range(1, tg.size):
-                            if tg[i] - bin_start >= avg_t:
-                                b += 1
-                                bin_start = tg[i]
-                            bin_inv[i] = b
-
-                n_bins = int(bin_inv.max()) + 1
-                counts = np.bincount(bin_inv, minlength=n_bins).astype(np.float64)
-
-                group_plans.append({
-                    "ord_idx": ord_idx,
-                    "t_sorted": tg,           # used for fast time averaging
-                    "bin_inv": bin_inv,
-                    "counts": counts,
-                    "n_bins": n_bins,
-                    "tn_ref_idx": ord_idx[0], # representative row for tn cols
-                })
-
-            plan = {
-                "group_plans": group_plans,
-                "tn_cols": tn_cols,
-                "mean_cols": mean_cols,
-                "sigma_cols": sigma_cols,
-                "dtype": dtype,
-            }
-            self._coh_avg_plan_cache[plan_key] = plan
+        tn_cols, mean_cols, sigma_cols = (plan[key] for key in ('tn_cols', 'mean_cols', 'sigma_cols'))
 
         # ---------- apply plan to current values ----------
         out_chunks = []
@@ -1498,12 +1417,8 @@ class ModelLikelihood(bilby.Likelihood):
                     im = np.bincount(bin_inv, weights=vals.imag, minlength=n_bins) / counts
                     chunk[c] = re + 1j * im
                 else:
-                    num = np.bincount(
-                        bin_inv,
-                        weights=vals.astype(np.float64, copy=False),
-                        minlength=n_bins
-                    )
-                    chunk[c] = num / counts
+                    chunk[c] = np.bincount(bin_inv, weights=vals.astype(np.float64, copy=False),
+                                           minlength=n_bins) / counts
 
             # sigma combine: sqrt(sum(sigma^2))/N
             for c in sigma_cols:
