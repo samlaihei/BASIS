@@ -433,3 +433,71 @@ def DFT(data, uv, xfov=225, yfov=225):
     if input_ndim == 2:
         vis = vis.reshape(-1)
     return vis
+
+def _interpolation_kernel_ft(frequency, mode):
+    """Fourier transform of PyTorch's unit-spaced interpolation kernels.
+
+    Bicubic uses Keys' kernel with a=-0.75, rather than a cubic B-spline.
+    Polynomial moments give a stable Taylor expansion near zero; integration
+    by parts evaluates the same piecewise cubic exactly at higher frequencies.
+    """
+    if mode == 'nearest':
+        return torch.sinc(frequency)
+    if mode == 'bilinear':
+        return torch.sinc(frequency).square()
+    if mode != 'bicubic':
+        raise ValueError("Unsupported interpolation mode: " + str(mode))
+
+    w = 2 * torch.pi * frequency
+    small = w.abs() < 2
+    ws = torch.where(small, w, torch.zeros_like(w))
+    wh = torch.where(small, torch.full_like(w, 2), w)
+    series = torch.zeros_like(w)
+    exact = torch.zeros_like(w)
+    for lo, hi, coeffs in ((0, 1, (1, 0, -2.25, 1.25)),
+                           (1, 2, (3, -6, 3.75, -0.75))):
+        term = torch.ones_like(w)
+        for k in range(24):
+            moment = sum(c * (hi**(n + 2*k + 1) - lo**(n + 2*k + 1))
+                         / (n + 2*k + 1) for n, c in enumerate(coeffs))
+            series = series + 2 * moment * term
+            term = term * (-ws.square()) / ((2*k + 1) * (2*k + 2))
+        ea, eb = torch.exp(1j * wh * lo), torch.exp(1j * wh * hi)
+        integral = (eb - ea) / (1j * wh)
+        polynomial = coeffs[0] * integral
+        for n in range(1, 4):
+            integral = (hi**n * eb - lo**n * ea - n * integral) / (1j * wh)
+            polynomial = polynomial + coeffs[n] * integral
+        exact = exact + 2 * polynomial.real
+    return torch.where(small, series, exact)
+
+
+def pixelgrid(uv, pixels, flux, spacing, centers, mode='bicubic', sigma=0):
+    """Continuous interpolated-grid visibilities (angles in radians).
+
+    ``pixels`` is indexed [y, x]; ``centers`` gives the shared x/y control
+    point coordinates. Kernels extend beyond the outer control points, with
+    zero-valued padding. Gaussian convolution is evaluated on the full sky.
+    Bicubic negative lobes are retained: clipping the raster is nonlinear and
+    is intentionally available only through the model's explicit DFT path.
+    """
+    pixels = torch.as_tensor(pixels)
+    u, v = _split_uv(uv)
+    dtype = torch.promote_types(pixels.dtype, u.dtype)
+    if not dtype.is_floating_point:
+        dtype = torch.get_default_dtype()
+    u, v = u.to(device=pixels.device, dtype=dtype), v.to(device=pixels.device, dtype=dtype)
+    u, v = torch.broadcast_tensors(u, v)
+    pixels = pixels.to(dtype=dtype)
+    centers = torch.as_tensor(centers, dtype=dtype, device=pixels.device)
+    spacing = _to_like(spacing, u)
+    total = pixels.sum()
+    if bool(total <= 0):
+        raise ValueError("Pixelgrid has non-positive total flux.")
+    px = torch.exp(-2j * torch.pi * u[..., None] * centers)
+    py = torch.exp(-2j * torch.pi * v[..., None] * centers)
+    weighted = torch.einsum('...y,yx,...x->...', py, pixels.to(px.dtype), px)
+    kernel = _interpolation_kernel_ft(u * spacing, mode) * _interpolation_kernel_ft(v * spacing, mode)
+    sigma = _to_like(sigma, u)
+    blur = torch.exp(-2 * torch.pi**2 * sigma.square() * (u.square() + v.square()))
+    return _to_like(flux, u) * weighted / total * kernel * blur

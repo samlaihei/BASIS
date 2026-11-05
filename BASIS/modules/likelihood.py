@@ -1,5 +1,5 @@
-from GCFit.models import base
-from GCFit.modules import utils
+from BASIS.models import base
+from BASIS.modules import utils
 
 import bilby
 import numpy as np

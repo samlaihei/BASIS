@@ -169,7 +169,7 @@ class pixelgrid(object):
         return model
 
 
-    def sample_vis(self, uv, ttype='direct'):
+    def sample_vis(self, uv, ttype='analytical'):
         """Samples the visibilities at given (u, v) coordinates.
 
         Parameters
@@ -177,13 +177,31 @@ class pixelgrid(object):
         uv : array_like
             The (u, v) coordinates in wavelengths.
         ttype : str
-            The type of sampling method ('direct' or 'DFT').
+            'analytical' (default), or 'direct'/'DFT' for the raster DFT.
+            The analytic model retains signed bicubic lobes and evaluates
+            Gaussian convolution without image-FOV truncation.
 
         Returns
         -------
         vis : array_like
             The sampled visibilities.
         """
-        image = self.sky_map()
-        dvis = vis.DFT(image.unsqueeze(0) if torch.is_tensor(image) else np.expand_dims(image, 0), uv, xfov=self.fov, yfov=self.fov)[0]
-        return dvis
+        if ttype.lower() in ('direct', 'dft'):
+            image = self.sky_map()
+            return vis.DFT(image.unsqueeze(0) if torch.is_tensor(image) else np.expand_dims(image, 0), uv, xfov=self.fov, yfov=self.fov)[0]
+        if ttype.lower() not in ('analytical', 'analytic'):
+            raise ValueError("Unknown visibility sampling method: " + str(ttype))
+
+        values = [self.I0, self.gauss_blur_sigma] + self.pixel_values
+        ref = next((value for value in values if torch.is_tensor(value)), None)
+        uv_ref = torch.as_tensor(uv[0] if isinstance(uv, (tuple, list)) and len(uv) == 2 else uv)
+        dtype = ref.dtype if ref is not None else torch.float64
+        device = ref.device if ref is not None else uv_ref.device
+        coarse = torch.stack(list(utils._as_tensors(*self.pixel_values, dtype=dtype, device=device))).reshape(self.grid_n, self.grid_n)
+        canvas_dim = _coarse_canvas_dim(self.grid_n)
+        start = (canvas_dim - self.grid_n) // 2
+        spacing = self.fov * 4.84813681109536e-12 / canvas_dim
+        centers = (torch.arange(self.grid_n, dtype=dtype, device=device) + start + 0.5 - canvas_dim / 2) * spacing
+        mode = self.interp_mode if self.interp_mode is not None else _interp_mode_from_order(float(self.interp_order))
+        return vis.pixelgrid(uv, coarse, self.I0, spacing, centers, mode,
+                             self.gauss_blur_sigma * 4.84813681109536e-12)
