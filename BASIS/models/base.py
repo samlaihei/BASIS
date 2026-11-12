@@ -286,6 +286,24 @@ class BaseModel(object):
         """Returns the number of parameters in the model."""
         return len(self.params)
 
+    def interchangeable_components(self):
+        """Return groups invariant under relabeling with the current model priors.
+
+        Compare every bound and fixed value after loading parameter files and
+        applying flux/position anchors. Free initial values do not affect priors.
+        This only identifies symmetry; it never sorts forward-model parameters.
+        """
+        groups = {}
+        for index, model_name in enumerate(self.model_list):
+            names = sorted(_params_for_model(model_name))
+            signature = (_resolve_model_name(model_name), tuple(
+                (name, tuple(self.param_limits[f'{index}_{name}']),
+                 bool(self.param_fixed[f'{index}_{name}']),
+                 float(self.params[f'{index}_{name}']) if self.param_fixed[f'{index}_{name}'] else None)
+                for name in names))
+            groups.setdefault(signature, []).append(index)
+        return [indices for indices in groups.values() if len(indices) > 1]
+
     def set_params(self, new_params, normalised=False):
         """Sets new parameters for the model from a vector.
 
