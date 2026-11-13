@@ -196,11 +196,6 @@ class BaseModel(object):
                 if key in params:
                     self.params[key] = params[key]
 
-        # if all models are the same model, we can apply some heuristics to center the model and fix the brightest component
-        if len(set(model_list)) == 1 and len(model_list) > 1:
-            self.center_and_fix_brightest(center=True, fix_brightest=True)
-            print("All models are the same, centering on brightest component and fixing its flux.")
-
     def load_params_from_file(self, filepath):
         """Reads parameter properties from a json file and updates the model's parameters, limits, and fixed status.
 

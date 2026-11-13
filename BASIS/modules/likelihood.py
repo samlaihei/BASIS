@@ -69,6 +69,7 @@ class ModelLikelihood(bilby.Likelihood):
         
         if self.model_names is not None:
             self.model = base.BaseModel(model_list=self.model_names, dim=self.imgdim, fov=self.fov)
+            self.configure_closure_model()
             self.params = self.model.params
 
     @staticmethod
@@ -1235,6 +1236,45 @@ class ModelLikelihood(bilby.Likelihood):
             complex_ci = ci[:len(ci)//2] + 1j*ci[len(ci)//2:]
             ci_err = ci_err[:len(ci_err)//2] + 1j * ci_err[len(ci_err)//2:]
             return complex_ci, ci_err
+
+
+    def configure_closure_model(self, brightest_value=10, minimum=0.001, maximum=100):
+        """Remove closure-only flux/position freedoms and widen relative flux bounds.
+
+        Component zero sets the flux scale and position origin. For identical
+        model types, use BaseModel's brightest-component convention as well.
+        """
+        if not np.isfinite(brightest_value) or brightest_value <= 0:
+            raise ValueError('brightest_value must be finite and positive.')
+        model = self.model
+        active_terms = {term for term, weight in self.dterms.items() if weight != 0}
+        if not active_terms or active_terms & {'vis', 'visamp', 'bispec'}:
+            return
+        if not 0 < minimum < maximum:
+            raise ValueError('Closure intensity bounds must satisfy 0 < minimum < maximum.')
+
+        before = {key: (model.params[key], model.param_fixed[key], model.param_limits[key])
+                  for key in model.params}
+        if len(set(model.model_list)) == 1:
+            model.center_and_fix_brightest(brightest_value=brightest_value)
+        if '0_I0' in model.params:
+            model.params['0_I0'] = brightest_value
+            model.param_fixed['0_I0'] = True
+            model.param_limits['0_I0'] = (brightest_value, brightest_value)
+        for key in ('0_xoff', '0_yoff'):
+            if key in model.params:
+                model.params[key] = 0
+                model.param_fixed[key] = True
+        for key in model.params:
+            component, name = key.split('_', 1)
+            if component != '0' and name == 'I0' and not model.param_fixed[key]:
+                low, high = model.param_limits[key]
+                model.param_limits[key] = (min(low, minimum), max(high, maximum))
+            after = (model.params[key], model.param_fixed[key], model.param_limits[key])
+            if before[key] != after:
+                print(f'Closure-only setup: {key}: value, fixed, limits '
+                      f'{before[key]} -> {after}')
+
 
     def add_scans(self, time_array, dt=0.0165, margin=0.0001):
         """
